@@ -487,6 +487,7 @@ def ensure_creators_table(conn: sqlite3.Connection) -> None:
             podcastindex_id INTEGER,
             podcastguid TEXT,
             itunesid INTEGER,
+            language TEXT,
             created_at DATETIME DEFAULT CURRENT_TIMESTAMP
         )
         """
@@ -552,28 +553,43 @@ def show_enrichment(args: argparse.Namespace) -> int:
     conn.row_factory = sqlite3.Row
     configure_sqlite(conn)
     try:
+        def load_json(val):
+            try:
+                return json.loads(val) if val else {}
+            except Exception:
+                return {}
+
+        def count_nonempty(d: Dict) -> int:
+            if not isinstance(d, dict):
+                return 0
+            return sum(1 for v in d.values() if v not in (None, "", [], {}))
+
         if not args.source:
-            # Summary counts of populated JSON keys
-            rows = conn.execute(
+            cur = conn.execute(
                 """
-                SELECT
-                    COUNT(*) as total,
-                    SUM(CASE WHEN json_valid(source_spotify) THEN 1 ELSE 0 END) as spotify_pop,
-                    SUM(CASE WHEN json_valid(source_apple) THEN 1 ELSE 0 END) as apple_pop,
-                    SUM(CASE WHEN json_valid(source_youtube) THEN 1 ELSE 0 END) as youtube_pop,
-                    SUM(CASE WHEN json_valid(source_social) THEN 1 ELSE 0 END) as social_pop
-                FROM creator_enrichment
-                """
-            ).fetchone()
-            if not rows or rows["total"] == 0:
+                SELECT ce.podcastindex_id, ce.source_spotify, ce.source_apple, ce.source_youtube, ce.source_social,
+                       pf.title as name
+                FROM creator_enrichment ce
+                LEFT JOIN podcastindex_feeds pf ON pf.id = ce.podcastindex_id
+                LIMIT ?
+                """,
+                (args.limit,),
+            )
+            rows = cur.fetchall()
+            if not rows:
                 print("No enrichment rows found.")
                 return 0
-            total = rows["total"]
-            print(f"Total enriched rows: {total}")
-            print(f"spotify: {rows['spotify_pop']} data")
-            print(f"apple: {rows['apple_pop']} data")
-            print(f"youtube: {rows['youtube_pop']} data")
-            print(f"social: {rows['social_pop']} data")
+            for row in rows:
+                spotify_j = load_json(row["source_spotify"])
+                apple_j = load_json(row["source_apple"])
+                youtube_j = load_json(row["source_youtube"])
+                social_j = load_json(row["source_social"])
+                print(f"name: {row['name'] or 'N/A'}")
+                print(f"spotify: {count_nonempty(spotify_j)} data")
+                print(f"apple: {count_nonempty(apple_j)} data")
+                print(f"youtube: {count_nonempty(youtube_j)} data")
+                print(f"social: {count_nonempty(social_j)} data")
+                print("")
             return 0
 
         col = {
@@ -584,8 +600,10 @@ def show_enrichment(args: argparse.Namespace) -> int:
         }[args.source]
         cur = conn.execute(
             f"""
-            SELECT podcastindex_id, {col} FROM creator_enrichment
-            WHERE {col} IS NOT NULL
+            SELECT ce.podcastindex_id, ce.{col}, pf.title as name
+            FROM creator_enrichment ce
+            LEFT JOIN podcastindex_feeds pf ON pf.id = ce.podcastindex_id
+            WHERE ce.{col} IS NOT NULL
             LIMIT ?
             """,
             (args.limit,),
@@ -595,13 +613,16 @@ def show_enrichment(args: argparse.Namespace) -> int:
             print(f"No rows with {args.source} data.")
             return 0
         for row in rows:
-            try:
-                data = json.loads(row[col]) if row[col] else {}
-            except Exception:
-                data = {}
-            keys_count = len(data.keys()) if isinstance(data, dict) else 0
-            status = data.get("status") if isinstance(data, dict) else None
-            print(f"{row['podcastindex_id']}: keys={keys_count} status={status} data={row[col]}")
+            data = load_json(row[col])
+            if not isinstance(data, dict):
+                print(f"{row['name'] or row['podcastindex_id']}: (invalid JSON)")
+                continue
+            print(f"{row['name'] or row['podcastindex_id']}:")
+            for k, v in data.items():
+                if v in (None, "", [], {}):
+                    continue
+                print(f"  {k}: {v}")
+            print("")
         return 0
     finally:
         conn.close()
@@ -651,8 +672,8 @@ def ingest_podcastindex_feeds(args: argparse.Namespace) -> int:
         """
         creator_sql = """
             INSERT OR IGNORE INTO creators (
-                podcastindex_id, podcastguid, itunesid
-            ) VALUES (?, ?, ?)
+                podcastindex_id, podcastguid, itunesid, language
+            ) VALUES (?, ?, ?, ?)
         """
 
         total_processed = 0
@@ -704,13 +725,12 @@ def ingest_podcastindex_feeds(args: argparse.Namespace) -> int:
                 inserted_feeds += 1
 
                 if podcastindex_id not in existing_creators_by_pid:
-                    categories = [row[f"category{i}"] for i in range(1, 11) if row[f"category{i}"]]
-                    categories_text = ", ".join(categories)
                     creator_rows.append(
                         (
                             podcastindex_id,
                             podcastguid,
                             itunes_id,
+                            row["language"],
                         )
                     )
                     existing_creators_by_pid.add(podcastindex_id)
@@ -1088,7 +1108,7 @@ def enrich_creators(args: argparse.Namespace) -> int:
         if args.only_id:
             cursor.execute(
                 """
-                SELECT c.podcastindex_id, c.itunesid,
+                SELECT c.podcastindex_id, c.itunesid, c.language,
                        p.url as feed_url, p.title as pi_title, p.description as pi_description,
                        p.category1, p.category2, p.category3, p.category4, p.category5,
                        p.category6, p.category7, p.category8, p.category9, p.category10,
@@ -1102,7 +1122,7 @@ def enrich_creators(args: argparse.Namespace) -> int:
         else:
             cursor.execute(
                 """
-                SELECT c.podcastindex_id, c.itunesid,
+                SELECT c.podcastindex_id, c.itunesid, c.language,
                        p.url as feed_url, p.title as pi_title, p.description as pi_description,
                        p.category1, p.category2, p.category3, p.category4, p.category5,
                        p.category6, p.category7, p.category8, p.category9, p.category10,
@@ -1134,6 +1154,9 @@ def enrich_creators(args: argparse.Namespace) -> int:
         for row in rows:
             podcastindex_id = row["podcastindex_id"]
             itunes_id = row["itunesid"]
+            language = (row["language"] or "").lower()
+            if language and "en" not in language:
+                continue
             base = dict(row)
             # Use feed URL to guess spotify URL if it matches open.spotify.com/show/...
             spotify_url = base.get("feed_url") if base.get("feed_url", "").startswith("https://open.spotify.com/show/") else None
@@ -1451,8 +1474,8 @@ def parse_args(argv: Optional[Sequence[str]] = None) -> argparse.Namespace:
     show_parser.add_argument(
         "--limit",
         type=int,
-        default=20,
-        help="Max rows to display when listing a specific source (default: 20)",
+        default=5,
+        help="Max rows to display (default: 5)",
     )
 
     return parser.parse_args(argv)
