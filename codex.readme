@@ -1,0 +1,5 @@
+Guidance for Codex helpers
+
+- Treat `midrollv0` as read-only legacy reference. Do not modify files there, do not import from it, and do not wire new code to depend on it.
+- New work should live outside `midrollv0` and be self-contained. If you need ideas, you may read the legacy scripts only as inspiration.
+- If a task appears to require changing `midrollv0`, pause and ask for direction instead of editing. 

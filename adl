@@ -1,0 +1,1632 @@
+#!/usr/bin/env python3
+"""
+Adelined data CLI.
+
+Usage example:
+    python3 adl fetch apple --genres Technology,Business --letters A,B --output midrollv0/cache/apple_fetch.json
+"""
+
+import argparse
+import json
+import os
+import re
+import sqlite3
+import sys
+import time
+from dataclasses import dataclass
+from datetime import datetime
+from pathlib import Path
+from typing import Dict, Iterable, List, Optional, Sequence, Tuple
+
+import requests
+from bs4 import BeautifulSoup
+
+
+DEFAULT_GENRES: Dict[str, int] = {
+    "Technology": 1318,
+    "Business": 1321,
+    "Comedy": 1303,
+    "Society & Culture": 1324,
+    "Health & Fitness": 1307,
+    "Education": 1304,
+    "Music": 1310,
+    "News": 1311,
+    "Sports": 1316,
+    "True Crime": 1488,
+}
+
+DEFAULT_LETTERS: Sequence[str] = [chr(i) for i in range(65, 91)] + ["0"]
+
+PODCASTINDEX_COLUMNS: Sequence[str] = [
+    "id",
+    "url",
+    "title",
+    "lastUpdate",
+    "link",
+    "lastHttpStatus",
+    "dead",
+    "contentType",
+    "itunesId",
+    "originalUrl",
+    "itunesAuthor",
+    "itunesOwnerName",
+    "explicit",
+    "imageUrl",
+    "itunesType",
+    "generator",
+    "newestItemPubdate",
+    "language",
+    "oldestItemPubdate",
+    "episodeCount",
+    "popularityScore",
+    "priority",
+    "createdOn",
+    "updateFrequency",
+    "chash",
+    "host",
+    "newestEnclosureUrl",
+    "podcastGuid",
+    "description",
+    "category1",
+    "category2",
+    "category3",
+    "category4",
+    "category5",
+    "category6",
+    "category7",
+    "category8",
+    "category9",
+    "category10",
+    "newestEnclosureDuration",
+]
+
+
+@dataclass
+class PodcastRecord:
+    title: str
+    apple_url: str
+    itunes_id: int
+    genre: str
+    country: str
+    scraped_at: str
+
+
+@dataclass
+class YouTubeChannelRecord:
+    channel_url: str
+    title: str
+    description: str
+    about: str
+    subscribers: Optional[str]
+    scraped_at: str
+
+
+@dataclass
+class SpotifyShowRecord:
+    show_url: str
+    title: str
+    author: str
+    description: str
+    thumbnail: Optional[str]
+    scraped_at: str
+
+
+class AppleDirectoryFetcher:
+    def __init__(
+        self,
+        country: str,
+        genres: Sequence[str],
+        letters: Sequence[str],
+        delay: float = 1.0,
+        db_path: Optional[Path] = None,
+        user_agent: str = "Mozilla/5.0 AdelinedBot/0.1",
+    ):
+        self.country = country.lower()
+        self.genre_ids = DEFAULT_GENRES
+        self.genres = [self._normalise_genre(g) for g in genres]
+        self.letters = [letter.upper() for letter in letters]
+        self.delay = delay
+        self.db_path = db_path
+        self.session = requests.Session()
+        self.session.headers.update({"User-Agent": user_agent})
+
+    def fetch(self) -> List[PodcastRecord]:
+        all_records: List[PodcastRecord] = []
+        for genre in self.genres:
+            genre_id = self.genre_ids[genre]
+            for letter in self.letters:
+                url = self._build_url(genre, genre_id, letter)
+                html = self._get(url)
+                if not html:
+                    continue
+                records = self._parse_page(html, genre)
+                all_records.extend(records)
+                if self.delay:
+                    time.sleep(self.delay)
+
+        deduped = self._dedupe(all_records)
+        if self.db_path:
+            self._persist_sqlite(deduped)
+        return deduped
+
+    def _normalise_genre(self, name: str) -> str:
+        cleaned = name.strip()
+        for candidate in self.genre_ids:
+            if candidate.lower() == cleaned.lower():
+                return candidate
+        raise ValueError(f"Unknown genre '{name}'. Valid options: {', '.join(self.genre_ids)}")
+
+    def _build_url(self, genre_name: str, genre_id: int, letter: str) -> str:
+        slug = (
+            genre_name.lower()
+            .replace("&", "and")
+            .replace("  ", " ")
+            .strip()
+            .replace(" ", "-")
+        )
+        return f"https://podcasts.apple.com/{self.country}/genre/podcasts-{slug}/id{genre_id}?letter={letter}"
+
+    def _get(self, url: str) -> Optional[str]:
+        try:
+            res = self.session.get(url, timeout=20)
+            res.raise_for_status()
+            return res.text
+        except Exception as exc:
+            print(f"❌ Failed to fetch {url}: {exc}", file=sys.stderr)
+            return None
+
+    def _parse_page(self, html: str, genre_name: str) -> List[PodcastRecord]:
+        soup = BeautifulSoup(html, "html.parser")
+        records: List[PodcastRecord] = []
+        seen_urls = set()
+        for link in soup.find_all("a"):
+            href = link.get("href") or ""
+            if not href.startswith("https://podcasts.apple.com/") or "/podcast/" not in href:
+                continue
+            cleaned_href = href.split("?")[0]
+            if cleaned_href in seen_urls:
+                continue
+            itunes_id = self._extract_itunes_id(cleaned_href)
+            title = (link.text or "").strip()
+            if not title or not itunes_id:
+                continue
+            seen_urls.add(cleaned_href)
+            records.append(
+                PodcastRecord(
+                    title=title,
+                    apple_url=cleaned_href,
+                    itunes_id=itunes_id,
+                    genre=genre_name,
+                    country=self.country,
+                    scraped_at=datetime.utcnow().isoformat(),
+                )
+            )
+        return records
+
+    @staticmethod
+    def _extract_itunes_id(href: str) -> Optional[int]:
+        match = re.search(r"/id(\d+)", href)
+        if match:
+            return int(match.group(1))
+        return None
+
+    @staticmethod
+    def _dedupe(records: Iterable[PodcastRecord]) -> List[PodcastRecord]:
+        deduped: Dict[int, PodcastRecord] = {}
+        for rec in records:
+            # Keep first occurrence per iTunes ID.
+            if rec.itunes_id not in deduped:
+                deduped[rec.itunes_id] = rec
+        return list(deduped.values())
+
+    def _persist_sqlite(self, records: Sequence[PodcastRecord]) -> None:
+        if not records:
+            return
+        db_path = Path(self.db_path)
+        db_path.parent.mkdir(parents=True, exist_ok=True)
+        conn = sqlite3.connect(db_path)
+        try:
+            conn.execute(
+                """
+                CREATE TABLE IF NOT EXISTS apple_podcasts (
+                    id INTEGER PRIMARY KEY AUTOINCREMENT,
+                    title TEXT,
+                    apple_url TEXT,
+                    itunes_id INTEGER,
+                    genre TEXT,
+                    country TEXT,
+                    scraped_at DATETIME DEFAULT CURRENT_TIMESTAMP
+                )
+                """
+            )
+
+            existing_ids = {
+                row[0] for row in conn.execute("SELECT itunes_id FROM apple_podcasts")
+            }
+            new_rows = [
+                (
+                    rec.title,
+                    rec.apple_url,
+                    rec.itunes_id,
+                    rec.genre,
+                    rec.country,
+                    rec.scraped_at,
+                )
+                for rec in records
+                if rec.itunes_id not in existing_ids
+            ]
+            if not new_rows:
+                print("No new Apple podcasts to insert; all IDs already present.")
+                return
+            conn.executemany(
+                """
+                INSERT INTO apple_podcasts (title, apple_url, itunes_id, genre, country, scraped_at)
+                VALUES (?, ?, ?, ?, ?, ?)
+                """,
+                new_rows,
+            )
+            conn.commit()
+            print(f"💾 Stored {len(new_rows)} new rows in {db_path}")
+        finally:
+            conn.close()
+
+
+class YouTubeChannelFetcher:
+    def __init__(
+        self,
+        channels: Sequence[str],
+        delay: float = 1.0,
+        user_agent: str = "Mozilla/5.0 AdelinedBot/0.1",
+    ):
+        self.channels = channels
+        self.delay = delay
+        self.session = requests.Session()
+        self.session.headers.update({"User-Agent": user_agent})
+
+    def fetch(self) -> List[YouTubeChannelRecord]:
+        results: List[YouTubeChannelRecord] = []
+        for raw in self.channels:
+            url = self._normalise_channel_url(raw)
+            about_url = url.rstrip("/") + "/about"
+            html = self._get(about_url)
+            if not html:
+                continue
+            record = self._parse_about_page(url, html)
+            if record:
+                results.append(record)
+            if self.delay:
+                time.sleep(self.delay)
+        return results
+
+    def _normalise_channel_url(self, identifier: str) -> str:
+        ident = identifier.strip()
+        if ident.startswith("http://") or ident.startswith("https://"):
+            return ident
+        if ident.startswith("@"):
+            return f"https://www.youtube.com/{ident}"
+        if ident.startswith("UC"):
+            return f"https://www.youtube.com/channel/{ident}"
+        return f"https://www.youtube.com/@{ident}"
+
+    def _get(self, url: str) -> Optional[str]:
+        try:
+            res = self.session.get(url, timeout=20)
+            res.raise_for_status()
+            return res.text
+        except Exception as exc:
+            print(f"❌ Failed to fetch {url}: {exc}", file=sys.stderr)
+            return None
+
+    def _parse_about_page(self, channel_url: str, html: str) -> Optional[YouTubeChannelRecord]:
+        soup = BeautifulSoup(html, "html.parser")
+        title = (soup.find("meta", {"property": "og:title"}) or {}).get("content", "")
+        description = (soup.find("meta", {"property": "og:description"}) or {}).get(
+            "content", ""
+        )
+
+        about_text = ""
+        about_el = soup.select_one("#description-container") or soup.select_one(
+            "#description"
+        )
+        if about_el:
+            about_text = about_el.get_text(separator=" ", strip=True)
+
+        subscriber_text = None
+        sub_el = soup.select_one("#subscriber-count")
+        if sub_el:
+            subscriber_text = sub_el.get_text(strip=True)
+
+        scraped_at = datetime.utcnow().isoformat()
+        if not title and not description and not about_text:
+            return None
+        return YouTubeChannelRecord(
+            channel_url=channel_url,
+            title=title,
+            description=description,
+            about=about_text,
+            subscribers=subscriber_text,
+            scraped_at=scraped_at,
+        )
+
+
+class SpotifyShowFetcher:
+    def __init__(
+        self,
+        shows: Sequence[str],
+        delay: float = 1.0,
+        user_agent: str = "Mozilla/5.0 AdelinedBot/0.1",
+    ):
+        self.shows = shows
+        self.delay = delay
+        self.session = requests.Session()
+        self.session.headers.update({"User-Agent": user_agent})
+
+    def fetch(self) -> List[SpotifyShowRecord]:
+        results: List[SpotifyShowRecord] = []
+        for raw in self.shows:
+            url = self._normalise_show_url(raw)
+            html = self._get(url)
+            if not html:
+                continue
+            oembed = self._get_oembed(url)
+            record = self._parse_show_page(url, html, oembed)
+            if record:
+                results.append(record)
+            if self.delay:
+                time.sleep(self.delay)
+        return results
+
+    def _normalise_show_url(self, identifier: str) -> str:
+        ident = identifier.strip()
+        if ident.startswith("http://") or ident.startswith("https://"):
+            return ident
+        return f"https://open.spotify.com/show/{ident}"
+
+    def _get(self, url: str) -> Optional[str]:
+        try:
+            res = self.session.get(url, timeout=20)
+            res.raise_for_status()
+            return res.text
+        except Exception as exc:
+            print(f"❌ Failed to fetch {url}: {exc}", file=sys.stderr)
+            return None
+
+    def _get_oembed(self, url: str) -> Dict:
+        try:
+            res = self.session.get(
+                "https://open.spotify.com/oembed",
+                params={"url": url},
+                timeout=15,
+            )
+            res.raise_for_status()
+            return res.json()
+        except Exception:
+            return {}
+
+    def _parse_show_page(self, show_url: str, html: str, oembed: Dict) -> Optional[SpotifyShowRecord]:
+        soup = BeautifulSoup(html, "html.parser")
+        title = oembed.get("title") or (soup.find("meta", {"property": "og:title"}) or {}).get(
+            "content", ""
+        )
+        description = (
+            (soup.find("meta", {"property": "og:description"}) or {}).get("content", "")
+        )
+        author = oembed.get("author_name", "")
+        thumbnail = oembed.get("thumbnail_url") or (soup.find("meta", {"property": "og:image"}) or {}).get(
+            "content"
+        )
+
+        scraped_at = datetime.utcnow().isoformat()
+        if not title and not description:
+            return None
+        return SpotifyShowRecord(
+            show_url=show_url,
+            title=title or "",
+            author=author or "",
+            description=description or "",
+            thumbnail=thumbnail,
+            scraped_at=scraped_at,
+        )
+
+
+def ensure_podcastindex_tables(conn: sqlite3.Connection) -> None:
+    conn.execute(
+        """
+        CREATE TABLE IF NOT EXISTS podcastindex_feeds (
+            id INTEGER PRIMARY KEY,
+            url TEXT,
+            title TEXT,
+            lastUpdate INTEGER,
+            link TEXT,
+            lastHttpStatus INTEGER,
+            dead INTEGER,
+            contentType TEXT,
+            itunesId INTEGER,
+            originalUrl TEXT,
+            itunesAuthor TEXT,
+            itunesOwnerName TEXT,
+            explicit INTEGER,
+            imageUrl TEXT,
+            itunesType TEXT,
+            generator TEXT,
+            newestItemPubdate INTEGER,
+            language TEXT,
+            oldestItemPubdate INTEGER,
+            episodeCount INTEGER,
+            popularityScore INTEGER,
+            priority INTEGER,
+            createdOn INTEGER,
+            updateFrequency INTEGER,
+            chash TEXT,
+            host TEXT,
+            newestEnclosureUrl TEXT,
+            podcastGuid TEXT,
+            description TEXT,
+            category1 TEXT,
+            category2 TEXT,
+            category3 TEXT,
+            category4 TEXT,
+            category5 TEXT,
+            category6 TEXT,
+            category7 TEXT,
+            category8 TEXT,
+            category9 TEXT,
+            category10 TEXT,
+            newestEnclosureDuration INTEGER
+        )
+        """
+    )
+    conn.execute("CREATE INDEX IF NOT EXISTS idx_podcastindex_feeds_itunesId ON podcastindex_feeds(itunesId)")
+
+
+def ensure_creators_table(conn: sqlite3.Connection) -> None:
+    conn.execute(
+        """
+        CREATE TABLE IF NOT EXISTS creators (
+            adlid INTEGER PRIMARY KEY AUTOINCREMENT,
+            podcastindex_id INTEGER,
+            podcastguid TEXT,
+            itunesid INTEGER,
+            created_at DATETIME DEFAULT CURRENT_TIMESTAMP
+        )
+        """
+    )
+    conn.execute("CREATE UNIQUE INDEX IF NOT EXISTS idx_creators_pid ON creators(podcastindex_id)")
+    conn.execute("CREATE INDEX IF NOT EXISTS idx_creators_itunesid ON creators(itunesid)")
+
+
+def ensure_creator_enrichment_table(conn: sqlite3.Connection) -> None:
+    conn.execute(
+        """
+        CREATE TABLE IF NOT EXISTS creator_enrichment (
+            podcastindex_id INTEGER PRIMARY KEY,
+            uk_score REAL,
+            source_spotify TEXT,
+            source_apple TEXT,
+            source_youtube TEXT,
+            source_social TEXT,
+            cleaned_text_block TEXT,
+            raw_text_sources TEXT,
+            created_at DATETIME DEFAULT CURRENT_TIMESTAMP,
+            updated_at DATETIME DEFAULT CURRENT_TIMESTAMP
+        )
+        """
+    )
+
+
+def configure_sqlite(conn: sqlite3.Connection) -> None:
+    # Reduce lock contention and waits.
+    conn.execute("PRAGMA journal_mode=WAL;")
+    conn.execute("PRAGMA busy_timeout=5000;")
+
+
+def clear_enrichment(args: argparse.Namespace) -> int:
+    db_path = Path(args.adl_db)
+    if not db_path.exists():
+        print(f"❌ DB not found: {db_path}", file=sys.stderr)
+        return 1
+    response = input(
+        f"This will DELETE all rows from creator_enrichment in {db_path}. Type YES to confirm: "
+    ).strip()
+    if response != "YES":
+        print("Aborted; no changes made.")
+        return 0
+    conn = sqlite3.connect(db_path, timeout=10)
+    conn.row_factory = sqlite3.Row
+    configure_sqlite(conn)
+    try:
+        conn.execute("DELETE FROM creator_enrichment")
+        conn.commit()
+        print("✅ Cleared creator_enrichment.")
+        return 0
+    finally:
+        conn.close()
+
+
+def show_enrichment(args: argparse.Namespace) -> int:
+    db_path = Path(args.adl_db)
+    if not db_path.exists():
+        print(f"❌ DB not found: {db_path}", file=sys.stderr)
+        return 1
+    conn = sqlite3.connect(db_path, timeout=10)
+    conn.row_factory = sqlite3.Row
+    configure_sqlite(conn)
+    try:
+        if not args.source:
+            # Summary counts of populated JSON keys
+            rows = conn.execute(
+                """
+                SELECT
+                    COUNT(*) as total,
+                    SUM(CASE WHEN json_valid(source_spotify) THEN 1 ELSE 0 END) as spotify_pop,
+                    SUM(CASE WHEN json_valid(source_apple) THEN 1 ELSE 0 END) as apple_pop,
+                    SUM(CASE WHEN json_valid(source_youtube) THEN 1 ELSE 0 END) as youtube_pop,
+                    SUM(CASE WHEN json_valid(source_social) THEN 1 ELSE 0 END) as social_pop
+                FROM creator_enrichment
+                """
+            ).fetchone()
+            if not rows or rows["total"] == 0:
+                print("No enrichment rows found.")
+                return 0
+            total = rows["total"]
+            print(f"Total enriched rows: {total}")
+            print(f"spotify: {rows['spotify_pop']} data")
+            print(f"apple: {rows['apple_pop']} data")
+            print(f"youtube: {rows['youtube_pop']} data")
+            print(f"social: {rows['social_pop']} data")
+            return 0
+
+        col = {
+            "spotify": "source_spotify",
+            "apple": "source_apple",
+            "youtube": "source_youtube",
+            "social": "source_social",
+        }[args.source]
+        cur = conn.execute(
+            f"""
+            SELECT podcastindex_id, {col} FROM creator_enrichment
+            WHERE {col} IS NOT NULL
+            LIMIT ?
+            """,
+            (args.limit,),
+        )
+        rows = cur.fetchall()
+        if not rows:
+            print(f"No rows with {args.source} data.")
+            return 0
+        for row in rows:
+            try:
+                data = json.loads(row[col]) if row[col] else {}
+            except Exception:
+                data = {}
+            keys_count = len(data.keys()) if isinstance(data, dict) else 0
+            status = data.get("status") if isinstance(data, dict) else None
+            print(f"{row['podcastindex_id']}: keys={keys_count} status={status} data={row[col]}")
+        return 0
+    finally:
+        conn.close()
+
+
+def ingest_podcastindex_feeds(args: argparse.Namespace) -> int:
+    source_db = Path(args.source_db)
+    target_db = Path(args.target_db)
+
+    if not source_db.exists():
+        print(f"❌ Source DB not found: {source_db}", file=sys.stderr)
+        return 1
+
+    batch_size = args.batch_size
+    print(f"🔄 Ingesting from {source_db} -> {target_db} (batch size {batch_size})")
+
+    src = sqlite3.connect(source_db, timeout=10)
+    src.row_factory = sqlite3.Row
+    tgt = sqlite3.connect(target_db, timeout=10)
+    tgt.row_factory = sqlite3.Row
+    configure_sqlite(src)
+    configure_sqlite(tgt)
+
+    try:
+        ensure_podcastindex_tables(tgt)
+        ensure_creators_table(tgt)
+        ensure_creator_enrichment_table(tgt)
+
+        existing_podcastindex_ids = {
+            row[0] for row in tgt.execute("SELECT id FROM podcastindex_feeds")
+        }
+        existing_creators_by_pid = {
+            row[0] for row in tgt.execute("SELECT podcastindex_id FROM creators")
+        }
+
+        print(
+            f"Existing podcastindex ids: {len(existing_podcastindex_ids)} | "
+            f"creators by podcastindex_id: {len(existing_creators_by_pid)}"
+        )
+
+        src_cursor = src.execute("SELECT * FROM podcasts")
+
+        placeholders = ",".join("?" for _ in PODCASTINDEX_COLUMNS)
+        feed_sql = f"""
+            INSERT OR IGNORE INTO podcastindex_feeds ({','.join(PODCASTINDEX_COLUMNS)})
+            VALUES ({placeholders})
+        """
+        creator_sql = """
+            INSERT OR IGNORE INTO creators (
+                podcastindex_id, podcastguid, itunesid
+            ) VALUES (?, ?, ?)
+        """
+
+        total_processed = 0
+        inserted_feeds = 0
+        inserted_creators = 0
+        skipped_existing = 0
+
+        while True:
+            rows = src_cursor.fetchmany(batch_size)
+            if not rows:
+                break
+
+            feed_rows = []
+            creator_rows = []
+
+            for row in rows:
+                podcastindex_id = row["id"]
+                podcastguid = row["podcastGuid"]
+                itunes_id = row["itunesId"]
+
+                # Conflict check: if this podcastindex_id already exists with a different itunesId/podcastGuid, stop
+                if podcastindex_id in existing_podcastindex_ids:
+                    existing_row = tgt.execute(
+                        "SELECT itunesId, podcastGuid FROM podcastindex_feeds WHERE id = ?",
+                        (podcastindex_id,),
+                    ).fetchone()
+                    if existing_row:
+                        existing_itunes_val = existing_row[0]
+                        existing_guid_val = existing_row[1]
+                        if (
+                            existing_itunes_val
+                            and itunes_id
+                            and existing_itunes_val != itunes_id
+                        ) or (
+                            existing_guid_val
+                            and podcastguid
+                            and existing_guid_val != podcastguid
+                        ):
+                            raise RuntimeError(
+                                f"Conflicting data for podcastindex_id {podcastindex_id}: "
+                                f"existing itunes {existing_itunes_val} vs {itunes_id}, "
+                                f"guid {existing_guid_val} vs {podcastguid}"
+                            )
+                    skipped_existing += 1
+                    continue
+
+                feed_rows.append(tuple(row[col] for col in PODCASTINDEX_COLUMNS))
+                existing_podcastindex_ids.add(podcastindex_id)
+                inserted_feeds += 1
+
+                if podcastindex_id not in existing_creators_by_pid:
+                    categories = [row[f"category{i}"] for i in range(1, 11) if row[f"category{i}"]]
+                    categories_text = ", ".join(categories)
+                    creator_rows.append(
+                        (
+                            podcastindex_id,
+                            podcastguid,
+                            itunes_id,
+                        )
+                    )
+                    existing_creators_by_pid.add(podcastindex_id)
+                    inserted_creators += 1
+
+            if feed_rows:
+                tgt.executemany(feed_sql, feed_rows)
+            if creator_rows:
+                tgt.executemany(creator_sql, creator_rows)
+            tgt.commit()
+
+            total_processed += len(rows)
+            print(
+                f"Processed {total_processed:,} rows | inserted feeds: {inserted_feeds:,} | "
+                f"inserted creators: {inserted_creators:,} | skipped existing: {skipped_existing:,}"
+            )
+
+        print(
+            f"✅ Done. Inserted feeds: {inserted_feeds:,}; creators: {inserted_creators:,}; "
+            f"skipped existing podcastindex_id: {skipped_existing:,}"
+        )
+        return 0
+    finally:
+        src.close()
+        tgt.close()
+
+
+def parse_comma_list(raw: Optional[str], *, default: Sequence[str]) -> List[str]:
+    if not raw:
+        return list(default)
+    if raw.lower() == "all":
+        return list(default)
+    return [chunk.strip() for chunk in raw.split(",") if chunk.strip()]
+
+
+def load_list_inputs(raw: Optional[str], path: Optional[Path]) -> List[str]:
+    items: List[str] = []
+    if raw:
+        items.extend(parse_comma_list(raw, default=[]))
+    if path and path.exists():
+        items.extend([line.strip() for line in path.read_text().splitlines() if line.strip()])
+    # Deduplicate while preserving order
+    seen = set()
+    deduped = []
+    for item in items:
+        if item not in seen:
+            seen.add(item)
+            deduped.append(item)
+    return deduped
+
+
+def fetch_apple_metadata(itunes_id: Optional[int], title: str) -> Dict:
+    if not title and not itunes_id:
+        return {}
+    try:
+        params = {"entity": "podcast"}
+        if itunes_id:
+            params["id"] = itunes_id
+            url = "https://itunes.apple.com/lookup"
+        else:
+            params["term"] = title
+            params["limit"] = 3
+            url = "https://itunes.apple.com/search"
+        res = requests.get(url, params=params, timeout=15)
+        res.raise_for_status()
+        data = res.json()
+        results = data.get("results", [])
+        if not results:
+            return {}
+        best = results[0]
+        return {
+            "title": best.get("collectionName") or best.get("trackName"),
+            "description": best.get("description") or best.get("collectionExplicitness"),
+            "genres": best.get("genres"),
+            "publisher": best.get("artistName"),
+        }
+    except Exception as exc:
+        print(f"⚠️ Apple lookup failed: {exc}", file=sys.stderr)
+        return {}
+
+
+def fetch_spotify_metadata(show_url: Optional[str], title: str) -> Dict:
+    client_id = os.getenv("SPOTIFY_CLIENT_ID")
+    client_secret = os.getenv("SPOTIFY_CLIENT_SECRET")
+    if not client_id or not client_secret:
+        return {"status": "missing_credentials"}
+
+    try:
+        token_res = requests.post(
+            "https://accounts.spotify.com/api/token",
+            data={"grant_type": "client_credentials"},
+            auth=(client_id, client_secret),
+            timeout=15,
+        )
+        token_res.raise_for_status()
+        access_token = token_res.json().get("access_token")
+        headers = {"Authorization": f"Bearer {access_token}"}
+
+        show_id = None
+        if show_url and "open.spotify.com/show/" in show_url:
+            show_id = show_url.rstrip("/").split("/")[-1]
+        else:
+            if not title:
+                return {"status": "not_found"}
+            search_res = requests.get(
+                "https://api.spotify.com/v1/search",
+                headers=headers,
+                params={"q": title, "type": "show", "market": "GB", "limit": 3},
+                timeout=15,
+            )
+            search_res.raise_for_status()
+            items = search_res.json().get("shows", {}).get("items", [])
+            if items:
+                show_id = items[0]["id"]
+
+        if not show_id:
+            return {"status": "not_found"}
+
+        show_res = requests.get(
+            f"https://api.spotify.com/v1/shows/{show_id}",
+            headers=headers,
+            params={"market": "GB"},
+            timeout=15,
+        )
+        show_res.raise_for_status()
+        show_data = show_res.json()
+
+        ep_res = requests.get(
+            f"https://api.spotify.com/v1/shows/{show_id}/episodes",
+            headers=headers,
+            params={"market": "GB", "limit": 10},
+            timeout=15,
+        )
+        ep_res.raise_for_status()
+        eps = ep_res.json().get("items", []) or []
+        ep_samples = [
+            {"name": ep.get("name"), "description": ep.get("description")}
+            for ep in eps[:10]
+        ]
+
+        return {
+            "show": {
+                "id": show_id,
+                "name": show_data.get("name"),
+                "description": show_data.get("description"),
+                "publisher": show_data.get("publisher"),
+                "languages": show_data.get("languages"),
+                "total_episodes": show_data.get("total_episodes"),
+            },
+            "episodes_sample": ep_samples,
+            "status": "ok",
+        }
+    except Exception as exc:
+        print(f"⚠️ Spotify fetch failed: {exc}", file=sys.stderr)
+        return {"status": "error", "error": str(exc)}
+
+
+def fetch_youtube_metadata(title: str) -> Dict:
+    api_key = os.getenv("YOUTUBE_API_KEY")
+    if not api_key:
+        return {"status": "missing_credentials"}
+
+    try:
+        # Search channel
+        search_res = requests.get(
+            "https://www.googleapis.com/youtube/v3/search",
+            params={
+                "part": "snippet",
+                "q": title,
+                "type": "channel",
+                "regionCode": "GB",
+                "maxResults": 8,
+                "key": api_key,
+            },
+            timeout=15,
+        )
+        search_res.raise_for_status()
+        items = search_res.json().get("items", [])
+        picked_channel = None
+
+        for ch in items:
+            channel_id = ch["snippet"]["channelId"]
+            # Fetch channel details to get full description
+            chan_res = requests.get(
+                "https://www.googleapis.com/youtube/v3/channels",
+                params={
+                    "part": "snippet",
+                    "id": channel_id,
+                    "key": api_key,
+                },
+                timeout=15,
+            )
+            if chan_res.status_code != 200:
+                continue
+            chan_items = chan_res.json().get("items", [])
+            if not chan_items:
+                continue
+            chan_snip = chan_items[0].get("snippet", {}) or {}
+            channel_title = chan_snip.get("title", "")
+            channel_description = chan_snip.get("description", "")
+
+            lower_title = channel_title.lower()
+            if "topic" in lower_title or lower_title.endswith(" - topic"):
+                # Reject auto-generated topic channels
+                continue
+            if not channel_description or len(channel_description.strip()) < 20:
+                # Reject channels with no meaningful about text
+                continue
+
+            picked_channel = {
+                "id": channel_id,
+                "title": channel_title,
+                "about": channel_description,
+            }
+            break
+
+        if not picked_channel:
+            return {"status": "not_found"}
+
+        channel_id = picked_channel["id"]
+        channel_title = picked_channel["title"]
+        channel_description = picked_channel["about"]
+
+        # Fetch top videos by viewCount
+        videos_res = requests.get(
+            "https://www.googleapis.com/youtube/v3/search",
+            params={
+                "part": "snippet",
+                "channelId": channel_id,
+                "order": "viewCount",
+                "maxResults": 3,
+                "type": "video",
+                "key": api_key,
+            },
+            timeout=15,
+        )
+        videos_res.raise_for_status()
+        video_items = videos_res.json().get("items", []) or []
+        videos_sample = []
+        comments_sample: List[str] = []
+
+        for vid in video_items:
+            vid_id = vid["id"]["videoId"]
+            vid_title = vid["snippet"]["title"]
+            vid_desc = vid["snippet"].get("description", "")
+            videos_sample.append({"id": vid_id, "title": vid_title, "description": vid_desc})
+
+            # Comments
+            comments_res = requests.get(
+                "https://www.googleapis.com/youtube/v3/commentThreads",
+                params={
+                    "part": "snippet",
+                    "videoId": vid_id,
+                    "maxResults": 50,
+                    "order": "relevance",
+                    "textFormat": "plainText",
+                    "key": api_key,
+                },
+                timeout=15,
+            )
+            if comments_res.status_code == 200:
+                threads = comments_res.json().get("items", []) or []
+                for th in threads:
+                    top = th.get("snippet", {}).get("topLevelComment", {}).get("snippet", {})
+                    txt = top.get("textDisplay")
+                    if txt:
+                        comments_sample.append(txt)
+                    if len(comments_sample) >= 50:
+                        break
+            if len(comments_sample) >= 50:
+                break
+
+        return {
+            "channel": picked_channel,
+            "videos_sample": videos_sample,
+            "comments_sample": comments_sample[:50],
+            "status": "ok",
+        }
+    except Exception as exc:
+        print(f"⚠️ YouTube fetch failed: {exc}", file=sys.stderr)
+        return {"status": "error", "error": str(exc)}
+
+
+def fetch_social_bios(title: str) -> Dict:
+    # Placeholder: extend with real social scraping when strategy/links available.
+    return {}
+
+
+def build_text_block(
+    base: Dict,
+    apple: Dict,
+    spotify: Dict,
+    youtube: Dict,
+    social: Dict,
+) -> Tuple[str, Dict]:
+    # Compose raw sources
+    raw_sources = {
+        "podcastindex_description": base.get("pi_description"),
+        "spotify_description": (spotify.get("show", {}) if spotify else {}).get("description"),
+        "apple_description": apple.get("description"),
+        "youtube_about": (youtube.get("channel", {}) if youtube else {}).get("about"),
+        "youtube_descriptions": [v.get("description") for v in (youtube.get("videos_sample") or [])] if youtube else [],
+        "youtube_comments": youtube.get("comments_sample") if youtube else [],
+        "social_bios": {
+            "twitter": (social.get("twitter") or {}) if social else {},
+            "instagram": (social.get("instagram") or {}) if social else {},
+            "website_about": (social.get("website") or {}).get("about") if social else None,
+        },
+    }
+
+    categories = []
+    for key in ("category1", "category2", "category3", "category4", "category5", "category6", "category7", "category8", "category9", "category10"):
+        val = base.get(key)
+        if val:
+            categories.append(val)
+    categories_text = ", ".join(categories)
+
+    episode_summary = ""
+    if spotify.get("episodes_sample"):
+        titles = [ep.get("name") or "" for ep in spotify["episodes_sample"] if ep]
+        episode_summary = "; ".join(titles[:20])
+
+    text_block = f"""TITLE:
+{apple.get('title') or spotify.get('title') or base.get('pi_title') or ''}
+
+DESCRIPTION:
+{apple.get('description') or spotify.get('description') or base.get('pi_description') or ''}
+
+CATEGORIES:
+{categories_text}
+
+EPISODE_SUMMARY:
+{episode_summary}
+
+YOUTUBE_ABOUT:
+{youtube.get('about') or ''}
+
+YOUTUBE_COMMENTS:
+{youtube.get('comments') or ''}
+
+HOST_BIO:
+{social.get('bio') or ''}
+"""
+    cleaned = clean_text_block(text_block)
+    # Cap length to avoid runaway blobs
+    if len(cleaned) > 4000:
+        cleaned = cleaned[:4000]
+    return cleaned, raw_sources
+
+
+def enrich_creators(args: argparse.Namespace) -> int:
+    db_path = Path(args.adl_db)
+    if not db_path.exists():
+        print(f"❌ DB not found: {db_path}", file=sys.stderr)
+        return 1
+
+    have_spotify = bool(os.getenv("SPOTIFY_CLIENT_ID") and os.getenv("SPOTIFY_CLIENT_SECRET"))
+    have_youtube = bool(os.getenv("YOUTUBE_API_KEY"))
+    if not have_spotify:
+        print("❌ SPOTIFY_CLIENT_ID/SECRET not set; enrichment requires Spotify API.", file=sys.stderr)
+        return 1
+    if not have_youtube:
+        print("❌ YOUTUBE_API_KEY not set; enrichment requires YouTube API.", file=sys.stderr)
+        return 1
+
+    conn = sqlite3.connect(db_path, timeout=10)
+    conn.row_factory = sqlite3.Row
+    configure_sqlite(conn)
+    try:
+        ensure_podcastindex_tables(conn)
+        ensure_creators_table(conn)
+        ensure_creator_enrichment_table(conn)
+
+        cursor = conn.cursor()
+        if args.only_id:
+            cursor.execute(
+                """
+                SELECT c.podcastindex_id, c.itunesid,
+                       p.url as feed_url, p.title as pi_title, p.description as pi_description,
+                       p.category1, p.category2, p.category3, p.category4, p.category5,
+                       p.category6, p.category7, p.category8, p.category9, p.category10,
+                       p.podcastGuid
+                FROM creators c
+                LEFT JOIN podcastindex_feeds p ON c.podcastindex_id = p.id
+                WHERE c.podcastindex_id = ?
+                """,
+                (args.only_id,),
+            )
+        else:
+            cursor.execute(
+                """
+                SELECT c.podcastindex_id, c.itunesid,
+                       p.url as feed_url, p.title as pi_title, p.description as pi_description,
+                       p.category1, p.category2, p.category3, p.category4, p.category5,
+                       p.category6, p.category7, p.category8, p.category9, p.category10,
+                       p.podcastGuid
+                FROM creators c
+                LEFT JOIN podcastindex_feeds p ON c.podcastindex_id = p.id
+                WHERE c.podcastindex_id NOT IN (SELECT podcastindex_id FROM creator_enrichment)
+                LIMIT ? OFFSET ?
+                """,
+                (args.limit, args.offset),
+            )
+
+        rows = cursor.fetchall()
+        if not rows:
+            print("No creators to enrich.")
+            return 0
+
+        enriched_rows = 0
+        stats = {
+            "spotify_ok": 0,
+            "spotify_missing": 0,
+            "spotify_not_found": 0,
+            "youtube_ok": 0,
+            "youtube_missing": 0,
+            "youtube_not_found": 0,
+            "apple_ok": 0,
+            "apple_not_found": 0,
+        }
+        for row in rows:
+            podcastindex_id = row["podcastindex_id"]
+            itunes_id = row["itunesid"]
+            base = dict(row)
+            # Use feed URL to guess spotify URL if it matches open.spotify.com/show/...
+            spotify_url = base.get("feed_url") if base.get("feed_url", "").startswith("https://open.spotify.com/show/") else None
+
+            title_for_lookup = base.get("pi_title") or ""
+
+            apple_meta = fetch_apple_metadata(itunes_id, title_for_lookup)
+            spotify_meta = fetch_spotify_metadata(spotify_url, title_for_lookup)
+            youtube_meta = fetch_youtube_metadata(title_for_lookup)
+            social_meta = fetch_social_bios(title_for_lookup)
+
+            # Stats
+            apple_status = apple_meta.get("status") or ("ok" if apple_meta else "not_found")
+            spotify_status = spotify_meta.get("status") or ("ok" if spotify_meta else "not_found")
+            youtube_status = youtube_meta.get("status") or ("ok" if youtube_meta else "not_found")
+            if apple_status == "ok":
+                stats["apple_ok"] += 1
+            else:
+                stats["apple_not_found"] += 1
+            if spotify_status == "ok":
+                stats["spotify_ok"] += 1
+            elif spotify_status == "missing_credentials":
+                stats["spotify_missing"] += 1
+            else:
+                stats["spotify_not_found"] += 1
+            if youtube_status == "ok":
+                stats["youtube_ok"] += 1
+            elif youtube_status == "missing_credentials":
+                stats["youtube_missing"] += 1
+            else:
+                stats["youtube_not_found"] += 1
+
+            cleaned_text, raw_sources = build_text_block(
+                base=base,
+                apple=apple_meta,
+                spotify=spotify_meta,
+                youtube=youtube_meta,
+                social=social_meta,
+            )
+
+            uk_score = compute_uk_score(base, apple_meta, spotify_meta, youtube_meta, social_meta)
+
+            conn.execute(
+                """
+                INSERT OR REPLACE INTO creator_enrichment (
+                    podcastindex_id, uk_score, source_spotify, source_apple, source_youtube, source_social,
+                    cleaned_text_block, raw_text_sources, updated_at
+                ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, CURRENT_TIMESTAMP)
+                """,
+                (
+                    podcastindex_id,
+                    uk_score,
+                    json.dumps(spotify_meta),
+                    json.dumps(apple_meta),
+                    json.dumps(youtube_meta),
+                    json.dumps(social_meta),
+                    cleaned_text,
+                    json.dumps(raw_sources),
+                ),
+            )
+            enriched_rows += 1
+            if enriched_rows % 10 == 0:
+                conn.commit()
+                print(f"Enriched {enriched_rows}/{len(rows)} (last podcastindex_id={podcastindex_id})")
+
+        conn.commit()
+        print(
+            f"✅ Enriched {enriched_rows} creators. "
+            f"Apple ok: {stats['apple_ok']}, not_found/missing: {stats['apple_not_found']}; "
+            f"Spotify ok: {stats['spotify_ok']}, missing creds: {stats['spotify_missing']}, other: {stats['spotify_not_found']}; "
+            f"YouTube ok: {stats['youtube_ok']}, missing creds: {stats['youtube_missing']}, other: {stats['youtube_not_found']}"
+        )
+        return 0
+    finally:
+        conn.close()
+
+
+def clean_text_block(text: str) -> str:
+    """
+    Apply basic cleaning rules:
+    - strip URLs
+    - remove hashtags/handles
+    - remove boilerplate like 'like and subscribe'
+    - remove timestamps like [00:00], 00:00:
+    - collapse repeated whitespace
+    """
+    if not text:
+        return ""
+    # Remove URLs
+    text = re.sub(r"https?://\\S+|www\\.\\S+", " ", text)
+    # Remove hashtags/handles
+    text = re.sub(r"[@#][A-Za-z0-9_]+", " ", text)
+    # Remove timestamps like [00:00] or 00:00:
+    text = re.sub(r"\\[?\\b\\d{1,2}:\\d{2}(?::\\d{2})?\\]?\\:?", " ", text)
+    # Remove common boilerplate phrases
+    boilerplate_patterns = [
+        r"like and subscribe",
+        r"don’t forget to subscribe",
+        r"don't forget to subscribe",
+        r"check out our sponsor",
+        r"leave a comment",
+        r"support us on patreon",
+    ]
+    for pat in boilerplate_patterns:
+        text = re.sub(pat, " ", text, flags=re.IGNORECASE)
+    # Collapse repeated text: naive approach by splitting sentences and deduping consecutive repeats
+    parts = text.split(".")
+    deduped_parts = []
+    prev = None
+    for part in parts:
+        chunk = part.strip()
+        if not chunk:
+            continue
+        if chunk == prev:
+            continue
+        deduped_parts.append(chunk)
+        prev = chunk
+    text = ". ".join(deduped_parts)
+    # Normalize whitespace
+    text = re.sub(r"\\s+", " ", text).strip()
+    return text
+
+
+UK_KEYWORDS = [
+    "united kingdom",
+    "uk",
+    "british",
+    "england",
+    "scotland",
+    "wales",
+    "northern ireland",
+    "london",
+    "manchester",
+    "birmingham",
+    "leeds",
+    "glasgow",
+    "edinburgh",
+    "bristol",
+    "liverpool",
+    "cardiff",
+    "belfast",
+]
+
+
+def compute_uk_score(base: Dict, apple: Dict, spotify: Dict, youtube: Dict, social: Dict) -> float:
+    score = 0.0
+    haystack = " ".join(
+        [
+            str(base.get("pi_description") or ""),
+            str(base.get("pi_title") or ""),
+            str(apple.get("description") or ""),
+            str(spotify.get("description") or ""),
+            str(youtube.get("channel", {}).get("about", "") if youtube else ""),
+            str(social.get("website", {}).get("about", "") if social else ""),
+        ]
+    ).lower()
+
+    # PodcastIndex location not present in schema, so skip; use text heuristics.
+    if any(word in haystack for word in ("uk podcast", "british", "london", "uk-based", "britain")):
+        score += 0.4
+
+    # Cities / keywords
+    for kw in UK_KEYWORDS:
+        if kw in haystack:
+            score += 0.1
+            break
+
+    # Domain heuristic
+    feed_url = base.get("feed_url") or ""
+    if ".co.uk" in feed_url or feed_url.endswith(".uk"):
+        score += 0.2
+
+    # Cap 0..1
+    score = max(0.0, min(1.0, score))
+    return score
+
+
+def parse_args(argv: Optional[Sequence[str]] = None) -> argparse.Namespace:
+    parser = argparse.ArgumentParser(description="Adelined data CLI")
+    subparsers = parser.add_subparsers(dest="action", required=True)
+
+    fetch_parser = subparsers.add_parser("fetch", help="Fetch creator data from a source")
+    fetch_parser.add_argument(
+        "source",
+        choices=["apple", "youtube", "spotify"],
+        help="Data source to pull from",
+    )
+    fetch_parser.add_argument(
+        "--country",
+        default="gb",
+        help="Apple Podcasts country code (default: gb)",
+    )
+    fetch_parser.add_argument(
+        "--genres",
+        default="Technology,Business,Comedy",
+        help="Comma-separated genre names or 'all' (default: Technology,Business,Comedy)",
+    )
+    fetch_parser.add_argument(
+        "--letters",
+        default="A",
+        help="Comma-separated letters to scrape or 'all' for A-Z+0 (default: A)",
+    )
+    fetch_parser.add_argument(
+        "--delay",
+        type=float,
+        default=1.0,
+        help="Delay between requests in seconds",
+    )
+    fetch_parser.add_argument(
+        "--db",
+        type=Path,
+        help="Optional SQLite path to persist apple_podcasts rows",
+    )
+    fetch_parser.add_argument(
+        "--output",
+        type=Path,
+        help="Optional JSON output file to write results",
+    )
+
+    # YouTube options
+    fetch_parser.add_argument(
+        "--channels",
+        help="Comma-separated YouTube channel handles/IDs/URLs to fetch (for source youtube)",
+    )
+    fetch_parser.add_argument(
+        "--channels-file",
+        type=Path,
+        help="Path to newline-delimited list of YouTube channel handles/IDs/URLs",
+    )
+
+    # Spotify options
+    fetch_parser.add_argument(
+        "--shows",
+        help="Comma-separated Spotify show IDs or URLs to fetch (for source spotify)",
+    )
+    fetch_parser.add_argument(
+        "--shows-file",
+        type=Path,
+        help="Path to newline-delimited list of Spotify show IDs or URLs",
+    )
+
+    ingest_parser = subparsers.add_parser("ingest", help="Ingest data into the Adelined DB")
+    ingest_parser.add_argument(
+        "source",
+        choices=["podcastindex"],
+        help="Dataset to ingest",
+    )
+    ingest_parser.add_argument(
+        "--source-db",
+        type=Path,
+        default=Path("data/podcastindex_feeds.db"),
+        help="Path to source SQLite database (default: data/podcastindex_feeds.db)",
+    )
+    ingest_parser.add_argument(
+        "--target-db",
+        type=Path,
+        default=Path("adelined_matching.db"),
+        help="Path to target Adelined SQLite database (default: adelined_matching.db)",
+    )
+    ingest_parser.add_argument(
+        "--batch-size",
+        type=int,
+        default=5000,
+        help="Batch size for streaming copy (default: 5000)",
+    )
+
+    enrich_parser = subparsers.add_parser("enrich", help="Enrich creators with external signals")
+    enrich_parser.add_argument(
+        "--adl-db",
+        type=Path,
+        default=Path("adelined_matching.db"),
+        help="Path to Adelined SQLite database (default: adelined_matching.db)",
+    )
+    enrich_parser.add_argument(
+        "--limit",
+        type=int,
+        default=100,
+        help="Max creators to process in this run (default: 100)",
+    )
+    enrich_parser.add_argument(
+        "--offset",
+        type=int,
+        default=0,
+        help="Offset into creators table (default: 0)",
+    )
+    enrich_parser.add_argument(
+        "--only-id",
+        type=int,
+        help="Optional specific podcastindex_id to process",
+    )
+
+    report_parser = subparsers.add_parser("enrichment", help="Manage or inspect enrichment data")
+    report_sub = report_parser.add_subparsers(dest="enrichment_action", required=True)
+
+    clear_parser = report_sub.add_parser("clear", help="Clear creator_enrichment table (requires confirmation)")
+    clear_parser.add_argument(
+        "--adl-db",
+        type=Path,
+        default=Path("adelined_matching.db"),
+        help="Path to Adelined SQLite database (default: adelined_matching.db)",
+    )
+
+    show_parser = report_sub.add_parser("show", help="Show enrichment summaries or source data")
+    show_parser.add_argument(
+        "--adl-db",
+        type=Path,
+        default=Path("adelined_matching.db"),
+        help="Path to Adelined SQLite database (default: adelined_matching.db)",
+    )
+    show_parser.add_argument(
+        "--source",
+        choices=["spotify", "apple", "youtube", "social"],
+        help="Specific source to list; omit for summary counts",
+    )
+    show_parser.add_argument(
+        "--limit",
+        type=int,
+        default=20,
+        help="Max rows to display when listing a specific source (default: 20)",
+    )
+
+    return parser.parse_args(argv)
+
+
+def handle_fetch_apple(args: argparse.Namespace) -> int:
+    genres = parse_comma_list(args.genres, default=DEFAULT_GENRES.keys())
+    letters = parse_comma_list(args.letters, default=DEFAULT_LETTERS)
+
+    fetcher = AppleDirectoryFetcher(
+        country=args.country,
+        genres=genres,
+        letters=letters,
+        delay=args.delay,
+        db_path=args.db,
+    )
+
+    print(
+        f"Fetching Apple directory for country={args.country}, genres={genres}, letters={letters}..."
+    )
+    records = fetcher.fetch()
+    print(f"✅ Retrieved {len(records)} unique podcasts.")
+
+    if args.output:
+        args.output.parent.mkdir(parents=True, exist_ok=True)
+        payload = [record.__dict__ for record in records]
+        args.output.write_text(json.dumps(payload, indent=2))
+        print(f"💾 Wrote JSON: {args.output}")
+
+    preview = records[:5]
+    if preview:
+        print("Sample rows:")
+        for rec in preview:
+            print(f" • {rec.title} ({rec.genre}) — {rec.apple_url}")
+    return 0
+
+
+def handle_fetch_youtube(args: argparse.Namespace) -> int:
+    channel_inputs = load_list_inputs(args.channels, args.channels_file)
+    if not channel_inputs:
+        print("❌ Please provide YouTube channels via --channels or --channels-file", file=sys.stderr)
+        return 1
+
+    fetcher = YouTubeChannelFetcher(channels=channel_inputs, delay=args.delay)
+    print(f"Fetching YouTube channels: {channel_inputs}")
+    records = fetcher.fetch()
+    print(f"✅ Retrieved {len(records)} YouTube channels.")
+
+    if args.output:
+        args.output.parent.mkdir(parents=True, exist_ok=True)
+        payload = [record.__dict__ for record in records]
+        args.output.write_text(json.dumps(payload, indent=2))
+        print(f"💾 Wrote JSON: {args.output}")
+
+    preview = records[:5]
+    if preview:
+        print("Sample rows:")
+        for rec in preview:
+            print(f" • {rec.title} — {rec.channel_url}")
+    return 0
+
+
+def handle_fetch_spotify(args: argparse.Namespace) -> int:
+    show_inputs = load_list_inputs(args.shows, args.shows_file)
+    if not show_inputs:
+        print("❌ Please provide Spotify shows via --shows or --shows-file", file=sys.stderr)
+        return 1
+
+    fetcher = SpotifyShowFetcher(shows=show_inputs, delay=args.delay)
+    print(f"Fetching Spotify shows: {show_inputs}")
+    records = fetcher.fetch()
+    print(f"✅ Retrieved {len(records)} Spotify shows.")
+
+    if args.output:
+        args.output.parent.mkdir(parents=True, exist_ok=True)
+        payload = [record.__dict__ for record in records]
+        args.output.write_text(json.dumps(payload, indent=2))
+        print(f"💾 Wrote JSON: {args.output}")
+
+    preview = records[:5]
+    if preview:
+        print("Sample rows:")
+        for rec in preview:
+            print(f" • {rec.title} — {rec.show_url}")
+    return 0
+
+
+def main(argv: Optional[Sequence[str]] = None) -> int:
+    if argv is None:
+        argv = sys.argv[1:]
+
+    if len(argv) == 1 and argv[0].lower() == "help":
+        print_help()
+        return 0
+
+    args = parse_args(argv)
+    if args.action == "fetch":
+        if args.source == "apple":
+            return handle_fetch_apple(args)
+        if args.source == "youtube":
+            return handle_fetch_youtube(args)
+        if args.source == "spotify":
+            return handle_fetch_spotify(args)
+    if args.action == "ingest":
+        if args.source == "podcastindex":
+            return ingest_podcastindex_feeds(args)
+    if args.action == "enrich":
+        return enrich_creators(args)
+    if args.action == "enrichment":
+        if args.enrichment_action == "clear":
+            return clear_enrichment(args)
+        if args.enrichment_action == "show":
+            return show_enrichment(args)
+    print(f"Unknown action/source combination: {args.action} {args.source}")
+    return 1
+
+
+def print_help() -> None:
+    help_text = """
+Adelined CLI
+
+Commands:
+  python3 adl fetch apple [options]
+  python3 adl fetch youtube [options]
+  python3 adl fetch spotify [options]
+  python3 adl ingest podcastindex [options]
+
+Examples:
+  # Minimal: scrape Apple Tech + Business for letter A (default country gb)
+  python3 adl fetch apple
+
+  # Explicit genres/letters with delay
+  python3 adl fetch apple --country gb --genres Technology,Business,Comedy --letters A,B --delay 1.5
+
+  # Write results to JSON
+  python3 adl fetch apple --output cache/apple_fetch.json
+
+  # Persist to SQLite (creates table if missing, skips existing IDs)
+  python3 adl fetch apple --db data/podcast_apple_scrape.sqlite --genres all --letters all
+
+  # YouTube: fetch channel metadata by handles
+  python3 adl fetch youtube --channels @lexfridman,@hubermanlab
+
+  # YouTube: from file (one handle/URL/channel_id per line)
+  python3 adl fetch youtube --channels-file channels.txt --output cache/youtube.json
+
+  # Spotify: fetch show metadata by show IDs
+  python3 adl fetch spotify --shows 5AvwZVawapvyhJUIx71pdJ,4rOoJ6Egrf8K2IrywzwOMk
+
+  # Spotify: from URLs file
+  python3 adl fetch spotify --shows-file spotify_urls.txt --output cache/spotify.json
+
+  # Ingest PodcastIndex snapshot into Adelined DB (itunesId dedupe)
+  python3 adl ingest podcastindex --source-db data/podcastindex_feeds.db --target-db adelined_matching.db
+
+  # Enrich a slice of creators
+  python3 adl enrich --adl-db adelined_matching.db --limit 50 --offset 0
+  python3 adl enrich --adl-db adelined_matching.db --only-id 12345
+Options:
+  --country   Apple Podcasts store country code (default: gb)
+  --genres    Comma list or 'all' (default: Technology,Business,Comedy)
+  --letters   Comma list or 'all' for A-Z+0 (default: A)
+  --delay     Seconds between requests (default: 1.0)
+  --db        Optional SQLite path to persist rows
+  --output    Optional JSON file to write scraped records
+  --source-db Source SQLite path for ingest (default: data/podcastindex_feeds.db)
+  --target-db Target Adelined SQLite path (default: adelined_matching.db)
+  --batch-size Batch size for ingest (default: 5000)
+  --limit     Max creators to enrich per run (default: 100)
+  --offset    Offset into creators table (default: 0)
+  --only-id   Enrich only this podcastindex_id
+"""
+    print(help_text.strip())
+
+
+if __name__ == "__main__":
+    sys.exit(main())

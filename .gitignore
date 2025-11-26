@@ -1,0 +1,7 @@
+*.db
+__pycache__/
+.env
+*.sqlite
+*.pyc
+cache/
+midrollv0/
