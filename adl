@@ -1009,6 +1009,14 @@ def fetch_youtube_metadata(title: str) -> Dict:
             "comments_sample": comments_sample[:50],
             "status": "ok",
         }
+    except requests.HTTPError as http_err:
+        detail = ""
+        try:
+            detail = http_err.response.json()
+        except Exception:
+            detail = http_err.response.text if hasattr(http_err, "response") else ""
+        print(f"⚠️ YouTube fetch failed: {http_err} detail={detail}", file=sys.stderr)
+        return {"status": "error", "error": str(http_err), "detail": detail}
     except Exception as exc:
         print(f"⚠️ YouTube fetch failed: {exc}", file=sys.stderr)
         return {"status": "error", "error": str(exc)}
