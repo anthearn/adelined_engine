@@ -18,8 +18,13 @@ from datetime import datetime
 from pathlib import Path
 from typing import Dict, Iterable, List, Optional, Sequence, Tuple
 
+from dotenv import load_dotenv
+
+load_dotenv()
+
 import requests
 from bs4 import BeautifulSoup
+from openai import OpenAI
 
 
 PODCASTINDEX_COLUMNS: Sequence[str] = [
@@ -333,9 +338,41 @@ def ensure_creator_enrichment_table(conn: sqlite3.Connection) -> None:
             source_spotify TEXT,
             source_apple TEXT,
             source_youtube TEXT,
-            source_social TEXT,
+            source_social_twitter TEXT,
+            source_social_instagram TEXT,
+            source_social_website TEXT,
+            source_social_patreon TEXT,
             cleaned_text_block TEXT,
             raw_text_sources TEXT,
+            created_at DATETIME DEFAULT CURRENT_TIMESTAMP,
+            updated_at DATETIME DEFAULT CURRENT_TIMESTAMP
+        )
+        """
+    )
+
+
+def ensure_column(conn: sqlite3.Connection, table: str, column: str, coltype: str) -> None:
+    existing = {row[1] for row in conn.execute(f"PRAGMA table_info({table})")}
+    if column not in existing:
+        conn.execute(f"ALTER TABLE {table} ADD COLUMN {column} {coltype}")
+
+
+def ensure_brands_table(conn: sqlite3.Connection) -> None:
+    conn.execute(
+        """
+        CREATE TABLE IF NOT EXISTS brands (
+            adlid INTEGER PRIMARY KEY AUTOINCREMENT,
+            brand_name TEXT,
+            website_url TEXT UNIQUE,
+            source_website_raw TEXT,
+            source_linkedin_raw TEXT,
+            source_social_raw TEXT,
+            extracted_description TEXT,
+            extracted_product_category TEXT,
+            extracted_target_audience TEXT,
+            extracted_tone TEXT,
+            extracted_key_themes TEXT,
+            extracted_goals TEXT,
             created_at DATETIME DEFAULT CURRENT_TIMESTAMP,
             updated_at DATETIME DEFAULT CURRENT_TIMESTAMP
         )
@@ -446,7 +483,11 @@ def show_enrichment(args: argparse.Namespace) -> int:
             "spotify": "source_spotify",
             "apple": "source_apple",
             "youtube": "source_youtube",
-            "social": "source_social",
+            "social": "source_social_twitter",
+            "twitter": "source_social_twitter",
+            "instagram": "source_social_instagram",
+            "website": "source_social_website",
+            "patreon": "source_social_patreon",
         }[args.source]
         cur = conn.execute(
             f"""
@@ -557,6 +598,10 @@ def ingest_podcastindex_feeds(args: argparse.Namespace) -> int:
         ensure_podcastindex_tables(tgt)
         ensure_creators_table(tgt)
         ensure_creator_enrichment_table(tgt)
+        ensure_column(tgt, "creator_enrichment", "source_social_twitter", "TEXT")
+        ensure_column(tgt, "creator_enrichment", "source_social_instagram", "TEXT")
+        ensure_column(tgt, "creator_enrichment", "source_social_website", "TEXT")
+        ensure_column(tgt, "creator_enrichment", "source_social_patreon", "TEXT")
 
         existing_podcastindex_ids = {
             row[0] for row in tgt.execute("SELECT id FROM podcastindex_feeds")
@@ -859,6 +904,10 @@ def fetch_apple_metadata(itunes_id: Optional[int], title: str) -> Dict:
             "description": best.get("description") or best.get("collectionExplicitness"),
             "genres": best.get("genres"),
             "publisher": best.get("artistName"),
+            "artistUrl": best.get("artistViewUrl"),
+            "collectionUrl": best.get("collectionViewUrl"),
+            "feedUrl": best.get("feedUrl"),
+            "status": "ok",
         }
     except Exception as exc:
         print(f"⚠️ Apple lookup failed: {exc}", file=sys.stderr)
@@ -1175,6 +1224,10 @@ def enrich_creators(args: argparse.Namespace) -> int:
         ensure_podcastindex_tables(conn)
         ensure_creators_table(conn)
         ensure_creator_enrichment_table(conn)
+        ensure_column(conn, "creator_enrichment", "source_social_twitter", "TEXT")
+        ensure_column(conn, "creator_enrichment", "source_social_instagram", "TEXT")
+        ensure_column(conn, "creator_enrichment", "source_social_website", "TEXT")
+        ensure_column(conn, "creator_enrichment", "source_social_patreon", "TEXT")
 
         requested_sources = None
         if args.sources:
@@ -1192,7 +1245,8 @@ def enrich_creators(args: argparse.Namespace) -> int:
                        p.category1, p.category2, p.category3, p.category4, p.category5,
                        p.category6, p.category7, p.category8, p.category9, p.category10,
                        p.podcastGuid,
-                       ce.source_spotify, ce.source_apple, ce.source_youtube, ce.source_social
+                       ce.source_spotify, ce.source_apple, ce.source_youtube,
+                       ce.source_social_twitter, ce.source_social_instagram, ce.source_social_website, ce.source_social_patreon
                 FROM creators c
                 LEFT JOIN podcastindex_feeds p ON c.podcastindex_id = p.id
                 LEFT JOIN creator_enrichment ce ON ce.podcastindex_id = c.podcastindex_id
@@ -1208,7 +1262,8 @@ def enrich_creators(args: argparse.Namespace) -> int:
                        p.category1, p.category2, p.category3, p.category4, p.category5,
                        p.category6, p.category7, p.category8, p.category9, p.category10,
                        p.podcastGuid,
-                       ce.source_spotify, ce.source_apple, ce.source_youtube, ce.source_social
+                       ce.source_spotify, ce.source_apple, ce.source_youtube,
+                       ce.source_social_twitter, ce.source_social_instagram, ce.source_social_website, ce.source_social_patreon
                 FROM creators c
                 LEFT JOIN podcastindex_feeds p ON c.podcastindex_id = p.id
                 LEFT JOIN creator_enrichment ce ON ce.podcastindex_id = c.podcastindex_id
@@ -1241,19 +1296,51 @@ def enrich_creators(args: argparse.Namespace) -> int:
             existing_spotify = load_json(r["source_spotify"])
             existing_apple = load_json(r["source_apple"])
             existing_youtube = load_json(r["source_youtube"])
-            existing_social = load_json(r["source_social"])
-            ce_missing = r["source_spotify"] is None and r["source_apple"] is None and r["source_youtube"] is None and r["source_social"] is None
+            existing_social = {
+                "twitter": load_json(r["source_social_twitter"]),
+                "instagram": load_json(r["source_social_instagram"]),
+                "website": load_json(r["source_social_website"]),
+                "patreon": load_json(r["source_social_patreon"]),
+            }
+            ce_missing = (
+                r["source_spotify"] is None
+                and r["source_apple"] is None
+                and r["source_youtube"] is None
+                and r["source_social_twitter"] is None
+                and r["source_social_instagram"] is None
+                and r["source_social_website"] is None
+                and r["source_social_patreon"] is None
+            )
+
+            all_social_keys = {"twitter", "instagram", "website", "patreon"}
+            if requested_sources:
+                if "social" in requested_sources:
+                    requested_social_keys = all_social_keys
+                else:
+                    requested_social_keys = {s for s in requested_sources if s in all_social_keys}
+            else:
+                requested_social_keys = all_social_keys
+
+            def social_needs_refresh() -> bool:
+                for key in requested_social_keys:
+                    val = existing_social.get(key)
+                    if not val:
+                        return True
+                    if isinstance(val, dict) and len(val.keys()) == 0:
+                        return True
+                return False
+
             if not requested_sources:
-                # When no sources specified, refresh rows with any missing/error/empty source OR entirely missing enrichment
                 refresh_needed = ce_missing or any(
                     needs_source_refresh(src_name, existing)
                     for src_name, existing in [
                         ("spotify", existing_spotify),
                         ("apple", existing_apple),
                         ("youtube", existing_youtube),
-                        ("social", existing_social),
                     ]
                 )
+                if not refresh_needed:
+                    refresh_needed = social_needs_refresh()
                 if refresh_needed:
                     rows.append(r)
             else:
@@ -1262,11 +1349,12 @@ def enrich_creators(args: argparse.Namespace) -> int:
                     ("spotify", existing_spotify),
                     ("apple", existing_apple),
                     ("youtube", existing_youtube),
-                    ("social", existing_social),
                 ]:
                     if src_name in requested_sources and needs_source_refresh(src_name, existing):
                         refresh_needed = True
                         break
+                if not refresh_needed and requested_social_keys:
+                    refresh_needed = social_needs_refresh()
                 if refresh_needed or ce_missing:
                     rows.append(r)
 
@@ -1301,12 +1389,20 @@ def enrich_creators(args: argparse.Namespace) -> int:
             existing_spotify = load_json(row["source_spotify"])
             existing_apple = load_json(row["source_apple"])
             existing_youtube = load_json(row["source_youtube"])
-            existing_social = load_json(row["source_social"])
+            existing_social = {
+                "twitter": load_json(row["source_social_twitter"]),
+                "instagram": load_json(row["source_social_instagram"]),
+                "website": load_json(row["source_social_website"]),
+                "patreon": load_json(row["source_social_patreon"]),
+            }
 
             fetch_spotify_flag = ((not requested_sources) or ("spotify" in requested_sources)) and ("spotify" not in disabled_sources)
             fetch_apple_flag = ((not requested_sources) or ("apple" in requested_sources)) and ("apple" not in disabled_sources)
             fetch_youtube_flag = ((not requested_sources) or ("youtube" in requested_sources)) and ("youtube" not in disabled_sources)
-            fetch_social_flag = ((not requested_sources) or ("social" in requested_sources)) and ("social" not in disabled_sources)
+            social_requested = (not requested_sources) or ("social" in requested_sources) or any(
+                s in requested_sources for s in ["twitter", "instagram", "website", "patreon"]
+            )
+            fetch_social_flag = social_requested and ("social" not in disabled_sources)
 
             spotify_fetched = fetch_spotify_flag
             youtube_fetched = fetch_youtube_flag
@@ -1358,7 +1454,6 @@ def enrich_creators(args: argparse.Namespace) -> int:
             apple_status = apple_meta.get("status") or ("ok" if apple_meta else "not_found")
             spotify_status = spotify_meta.get("status") or ("ok" if spotify_meta else "not_found")
             youtube_status = youtube_meta.get("status") or ("ok" if youtube_meta else "not_found")
-            social_status = social_meta.get("status") if isinstance(social_meta, dict) else None
             if apple_status == "ok":
                 stats["apple_ok"] += 1
             else:
@@ -1389,9 +1484,10 @@ def enrich_creators(args: argparse.Namespace) -> int:
             conn.execute(
                 """
                 INSERT OR REPLACE INTO creator_enrichment (
-                    podcastindex_id, uk_score, source_spotify, source_apple, source_youtube, source_social,
+                    podcastindex_id, uk_score, source_spotify, source_apple, source_youtube,
+                    source_social_twitter, source_social_instagram, source_social_website, source_social_patreon,
                     cleaned_text_block, raw_text_sources, updated_at
-                ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, CURRENT_TIMESTAMP)
+                ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, CURRENT_TIMESTAMP)
                 """,
                 (
                     podcastindex_id,
@@ -1399,7 +1495,10 @@ def enrich_creators(args: argparse.Namespace) -> int:
                     json.dumps(spotify_meta),
                     json.dumps(apple_meta),
                     json.dumps(youtube_meta),
-                    json.dumps(social_meta),
+                    json.dumps(social_meta.get("twitter")) if social_meta.get("twitter") else None,
+                    json.dumps(social_meta.get("instagram")) if social_meta.get("instagram") else None,
+                    json.dumps(social_meta.get("website")) if social_meta.get("website") else None,
+                    json.dumps(social_meta.get("patreon")) if social_meta.get("patreon") else None,
                     cleaned_text,
                     json.dumps(raw_sources),
                 ),
@@ -1563,6 +1662,13 @@ def extract_social_candidates(base: Dict, apple: Dict, spotify: Dict, youtube: D
         urls.append(base["feed_url"])
     if base.get("web_link"):
         urls.append(base["web_link"])
+    # Apple URLs
+    if apple.get("artistUrl"):
+        urls.append(apple["artistUrl"])
+    if apple.get("collectionUrl"):
+        urls.append(apple["collectionUrl"])
+    if apple.get("feedUrl"):
+        urls.append(apple["feedUrl"])
 
     candidates = {"twitter": [], "instagram": [], "website": [], "patreon": []}
     for u in urls:
@@ -1573,45 +1679,60 @@ def extract_social_candidates(base: Dict, apple: Dict, spotify: Dict, youtube: D
             candidates["instagram"].append(u)
         elif "patreon.com" in lu:
             candidates["patreon"].append(u)
+        elif "linktr.ee" in lu or "linktree" in lu:
+            candidates["website"].append(u)
         else:
             candidates["website"].append(u)
     return candidates
 
 
 def fetch_twitter_bio(url: str) -> Optional[Dict]:
-    try:
-        res = requests.get(url, timeout=10)
-        if res.status_code != 200:
+    backoff = 2
+    for _ in range(3):
+        try:
+            res = requests.get(url, timeout=10)
+            if res.status_code != 200:
+                time.sleep(backoff)
+                backoff *= 2
+                continue
+            soup = BeautifulSoup(res.text, "html.parser")
+            meta = soup.find("meta", attrs={"name": "description"})
+            if meta and meta.get("content"):
+                bio = clean_bio_text(meta["content"])
+                if bio:
+                    handle = url.split("/")[-1]
+                    return {"handle": f"@{handle}", "bio": bio}
             return None
-        soup = BeautifulSoup(res.text, "html.parser")
-        meta = soup.find("meta", attrs={"name": "description"})
-        if meta and meta.get("content"):
-            bio = clean_bio_text(meta["content"])
-            if bio:
-                handle = url.split("/")[-1]
-                return {"handle": f"@{handle}", "bio": bio}
-    except Exception:
-        return None
+        except Exception:
+            time.sleep(backoff)
+            backoff *= 2
+            continue
     return None
 
 
 def fetch_instagram_bio(url: str) -> Optional[Dict]:
-    try:
-        res = requests.get(url, timeout=10)
-        if res.status_code != 200:
+    backoff = 2
+    for _ in range(3):
+        try:
+            res = requests.get(url, timeout=10)
+            if res.status_code != 200:
+                time.sleep(backoff)
+                backoff *= 2
+                continue
+            soup = BeautifulSoup(res.text, "html.parser")
+            meta = soup.find("meta", property="og:description")
+            if meta and meta.get("content"):
+                desc = meta["content"]
+                desc = desc.split("Followers")[0]
+                bio = clean_bio_text(desc)
+                if bio:
+                    handle = url.rstrip("/").split("/")[-1]
+                    return {"handle": f"@{handle}", "bio": bio}
             return None
-        soup = BeautifulSoup(res.text, "html.parser")
-        meta = soup.find("meta", property="og:description")
-        if meta and meta.get("content"):
-            desc = meta["content"]
-            # og:description has follower counts; take before "Followers" if present
-            desc = desc.split("Followers")[0]
-            bio = clean_bio_text(desc)
-            if bio:
-                handle = url.rstrip("/").split("/")[-1]
-                return {"handle": f"@{handle}", "bio": bio}
-    except Exception:
-        return None
+        except Exception:
+            time.sleep(backoff)
+            backoff *= 2
+            continue
     return None
 
 
@@ -1662,6 +1783,196 @@ def fetch_social_bios_from_sources(base: Dict, apple: Dict, spotify: Dict, youtu
         if ws:
             result["website"] = ws
     return result
+
+
+def scrape_website_text(url: str) -> Tuple[str, List[str]]:
+    try:
+        res = requests.get(url, timeout=15)
+        res.raise_for_status()
+        soup = BeautifulSoup(res.text, "html.parser")
+        for tag in soup(["script", "style", "nav", "footer"]):
+            tag.decompose()
+        text = soup.get_text(" ", strip=True)
+        links = [a.get("href") for a in soup.find_all("a") if a.get("href")]
+        # Limit size
+        if len(text) > 10000:
+            text = text[:10000]
+        return text, links
+    except Exception as exc:
+        print(f"⚠️ Website scrape failed for {url}: {exc}", file=sys.stderr)
+        return "", []
+
+
+def scrape_linkedin_about(url: str) -> str:
+    try:
+        res = requests.get(url, timeout=15)
+        if res.status_code != 200:
+            return ""
+        soup = BeautifulSoup(res.text, "html.parser")
+        meta = soup.find("meta", attrs={"name": "description"})
+        if meta and meta.get("content"):
+            return meta["content"][:2000]
+        return soup.get_text(" ", strip=True)[:2000]
+    except Exception:
+        return ""
+
+
+def find_social_links(links: List[str]) -> Dict[str, List[str]]:
+    cands = {"twitter": [], "instagram": [], "linkedin": [], "website": []}
+    for link in links:
+        if not link:
+            continue
+        l = link.lower()
+        if l.startswith("//"):
+            link = "https:" + link
+        if "linkedin.com" in l:
+            cands["linkedin"].append(link)
+        elif "twitter.com" in l or "x.com" in l:
+            cands["twitter"].append(link)
+        elif "instagram.com" in l:
+            cands["instagram"].append(link)
+        elif link.startswith("http"):
+            cands["website"].append(link)
+    return cands
+
+
+def get_openai_client() -> Optional[OpenAI]:
+    key = os.getenv("OPENAI_API_KEY")
+    if not key:
+        print("❌ OPENAI_API_KEY not set; cannot run brand extraction.", file=sys.stderr)
+        return None
+    return OpenAI(api_key=key)
+
+
+def extract_brand_fields(website_text: str, linkedin_text: str) -> Dict:
+    client = get_openai_client()
+    if not client:
+        return {}
+    material = f"{website_text}\n\n{linkedin_text}"
+    if len(material) > 12000:
+        material = material[:12000]
+    prompt = (
+        "You are an information extraction system.\n\n"
+        "Extract the following fields from the brand materials below.\n"
+        "Write CLEAR, SHORT, HIGH-SIGNAL text. No marketing fluff.\n"
+        "Output in JSON ONLY.\n\n"
+        "FIELDS TO EXTRACT:\n"
+        "- brand_name (max 5 words)\n"
+        "- description (1–3 sentences, plain meaning)\n"
+        "- product_category (1 line, e.g. \"SaaS / ERP / ecommerce tech\")\n"
+        "- target_audience (1–2 sentences)\n"
+        "- tone (5 adjectives max)\n"
+        "- key_themes (comma-separated keywords)\n"
+        "- goals (optional, 1 line: brand's marketing goals if clear)\n\n"
+        "BRAND MATERIAL BELOW:\n"
+        f"{material}"
+    )
+    try:
+        resp = client.chat.completions.create(
+            model="gpt-4o-mini",
+            messages=[{"role": "user", "content": prompt}],
+            temperature=0.2,
+            response_format={"type": "json_object"},
+        )
+        content = resp.choices[0].message.content
+        data = json.loads(content)
+        return data
+    except Exception as exc:
+        # Try to surface any returned text for debugging
+        raw = ""
+        try:
+            raw = resp.choices[0].message.content  # type: ignore
+        except Exception:
+            raw = ""
+        print(f"⚠️ GPT extraction failed: {exc} raw={raw}", file=sys.stderr)
+        return {}
+
+
+def ingest_brand(args: argparse.Namespace) -> int:
+    db_path = Path(args.adl_db)
+    if not db_path.exists():
+        print(f"❌ DB not found: {db_path}", file=sys.stderr)
+        return 1
+    conn = sqlite3.connect(db_path, timeout=10)
+    conn.row_factory = sqlite3.Row
+    configure_sqlite(conn)
+    ensure_brands_table(conn)
+
+    website_url = args.url
+    website_text, links = scrape_website_text(website_url)
+    socials = find_social_links(links)
+
+    linkedin_text = ""
+    if socials["linkedin"]:
+        linkedin_text = scrape_linkedin_about(socials["linkedin"][0])
+
+    social_raw = []
+    twitter_bio = None
+    instagram_bio = None
+    if socials["twitter"]:
+        twitter_bio = fetch_twitter_bio(socials["twitter"][0])
+        if twitter_bio:
+            social_raw.append({"twitter": twitter_bio})
+    if socials["instagram"]:
+        instagram_bio = fetch_instagram_bio(socials["instagram"][0])
+        if instagram_bio:
+            social_raw.append({"instagram": instagram_bio})
+    if socials["website"]:
+        about = fetch_website_about(website_url)
+        if about:
+            social_raw.append({"website": about})
+
+    extracted = extract_brand_fields(website_text, linkedin_text)
+    if not extracted:
+        print("❌ GPT extraction failed or no OPENAI_API_KEY; brand not inserted.")
+        return 1
+
+    brand_name = args.brand_name or extracted.get("brand_name")
+    def as_str(val):
+        if val is None:
+            return None
+        if isinstance(val, (list, dict)):
+            return json.dumps(val)
+        return str(val)
+
+    conn.execute(
+        """
+        INSERT INTO brands (
+            brand_name, website_url, source_website_raw, source_linkedin_raw, source_social_raw,
+            extracted_description, extracted_product_category, extracted_target_audience,
+            extracted_tone, extracted_key_themes, extracted_goals, created_at, updated_at
+        ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, CURRENT_TIMESTAMP, CURRENT_TIMESTAMP)
+        ON CONFLICT(website_url) DO UPDATE SET
+            brand_name=excluded.brand_name,
+            source_website_raw=excluded.source_website_raw,
+            source_linkedin_raw=excluded.source_linkedin_raw,
+            source_social_raw=excluded.source_social_raw,
+            extracted_description=excluded.extracted_description,
+            extracted_product_category=excluded.extracted_product_category,
+            extracted_target_audience=excluded.extracted_target_audience,
+            extracted_tone=excluded.extracted_tone,
+            extracted_key_themes=excluded.extracted_key_themes,
+            extracted_goals=excluded.extracted_goals,
+            updated_at=CURRENT_TIMESTAMP
+        """,
+        (
+            as_str(brand_name),
+            website_url,
+            website_text,
+            linkedin_text,
+            json.dumps(social_raw),
+            as_str(extracted.get("description")),
+            as_str(extracted.get("product_category")),
+            as_str(extracted.get("target_audience")),
+            as_str(extracted.get("tone")),
+            as_str(extracted.get("key_themes")),
+            as_str(extracted.get("goals")),
+        ),
+    )
+    conn.commit()
+    print(f"✅ Stored brand: {brand_name or website_url}")
+    conn.close()
+    return 0
 
 
 def parse_args(argv: Optional[Sequence[str]] = None) -> argparse.Namespace:
@@ -1815,7 +2126,7 @@ def parse_args(argv: Optional[Sequence[str]] = None) -> argparse.Namespace:
     )
     show_parser.add_argument(
         "--source",
-        choices=["spotify", "apple", "youtube", "social"],
+        choices=["spotify", "apple", "youtube", "social", "twitter", "instagram", "website", "patreon"],
         help="Specific source to list; omit for summary counts",
     )
     show_parser.add_argument(
@@ -1827,6 +2138,23 @@ def parse_args(argv: Optional[Sequence[str]] = None) -> argparse.Namespace:
 
     summary_parser = report_sub.add_parser("summary", help="Report overall enrichment coverage")
     summary_parser.add_argument(
+        "--adl-db",
+        type=Path,
+        default=Path("adelined_matching.db"),
+        help="Path to Adelined SQLite database (default: adelined_matching.db)",
+    )
+
+    brand_parser = subparsers.add_parser("brand", help="Ingest a brand by URL")
+    brand_parser.add_argument(
+        "--url",
+        required=True,
+        help="Brand website URL",
+    )
+    brand_parser.add_argument(
+        "--brand-name",
+        help="Optional brand name override",
+    )
+    brand_parser.add_argument(
         "--adl-db",
         type=Path,
         default=Path("adelined_matching.db"),
@@ -1917,6 +2245,8 @@ def main(argv: Optional[Sequence[str]] = None) -> int:
     if args.action == "discover":
         if args.source == "apple":
             return discover_apple(args)
+    if args.action == "brand":
+        return ingest_brand(args)
     print(f"Unknown action/source combination: {args.action} {args.source}")
     return 1
 
@@ -1934,6 +2264,7 @@ Commands:
   python3 adl enrichment clear [options]
   python3 adl enrichment show [options]
   python3 adl enrichment summary [options]
+  python3 adl brand --url <website>
 
 Examples:
   # YouTube: fetch channel metadata by handles
@@ -1957,6 +2288,8 @@ Examples:
   # Enrich a slice of creators
   python3 adl enrich --adl-db adelined_matching.db --limit 50 --offset 0
   python3 adl enrich --adl-db adelined_matching.db --only-id 12345
+  # Ingest a brand (scrape + GPT extract)
+  python3 adl brand --url https://brandsite.com
 Options:
   --output    Optional JSON file to write scraped records
   --source-db Source SQLite path for ingest (default: data/podcastindex_feeds.db)
