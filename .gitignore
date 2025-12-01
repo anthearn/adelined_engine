@@ -4,4 +4,5 @@ __pycache__/
 *.sqlite
 *.pyc
 cache/
+tests/
 midrollv0/

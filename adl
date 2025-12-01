@@ -18,14 +18,13 @@ from datetime import datetime
 from pathlib import Path
 from typing import Dict, Iterable, List, Optional, Sequence, Tuple
 
-from dotenv import load_dotenv
-
-load_dotenv()
-
 import requests
 from bs4 import BeautifulSoup
+import numpy as np
+from dotenv import load_dotenv
 from openai import OpenAI
 
+load_dotenv()
 
 PODCASTINDEX_COLUMNS: Sequence[str] = [
     "id",
@@ -321,6 +320,21 @@ def ensure_creators_table(conn: sqlite3.Connection) -> None:
             podcastguid TEXT,
             itunesid INTEGER,
             language TEXT,
+            title TEXT,
+            description TEXT,
+            feed_url TEXT,
+            web_link TEXT,
+            categories TEXT,
+            newestItemPubdate INTEGER,
+            oldestItemPubdate INTEGER,
+            episodeCount INTEGER,
+            updateFrequency INTEGER,
+            vertical TEXT,
+            audience_profile TEXT,
+            industry_keywords TEXT,
+            business_functions TEXT,
+            pain_points TEXT,
+            geo_focus TEXT,
             created_at DATETIME DEFAULT CURRENT_TIMESTAMP
         )
         """
@@ -333,7 +347,8 @@ def ensure_creator_enrichment_table(conn: sqlite3.Connection) -> None:
     conn.execute(
         """
         CREATE TABLE IF NOT EXISTS creator_enrichment (
-            podcastindex_id INTEGER PRIMARY KEY,
+            adlid INTEGER PRIMARY KEY AUTOINCREMENT,
+            podcastindex_id INTEGER,
             uk_score REAL,
             source_spotify TEXT,
             source_apple TEXT,
@@ -373,8 +388,60 @@ def ensure_brands_table(conn: sqlite3.Connection) -> None:
             extracted_tone TEXT,
             extracted_key_themes TEXT,
             extracted_goals TEXT,
+            brand_vertical TEXT,
+            brand_audience_profile TEXT,
+            brand_use_cases TEXT,
+            brand_pain_points TEXT,
+            brand_geo_focus TEXT,
+            brand_keywords TEXT,
+            brand_summary TEXT,
+            brand_vertical_override TEXT,
+            flag_inconsistent_positioning INTEGER,
+            recommended_vertical TEXT,
+            recommended_confidence REAL,
+            candidate_verticals TEXT,
             created_at DATETIME DEFAULT CURRENT_TIMESTAMP,
             updated_at DATETIME DEFAULT CURRENT_TIMESTAMP
+        )
+        """
+    )
+    # Ensure new columns on existing DBs
+    for col, coltype in [
+        ("brand_vertical", "TEXT"),
+        ("brand_audience_profile", "TEXT"),
+        ("brand_use_cases", "TEXT"),
+        ("brand_pain_points", "TEXT"),
+        ("brand_geo_focus", "TEXT"),
+        ("brand_keywords", "TEXT"),
+        ("brand_summary", "TEXT"),
+        ("brand_vertical_override", "TEXT"),
+        ("flag_inconsistent_positioning", "INTEGER"),
+        ("recommended_vertical", "TEXT"),
+        ("recommended_confidence", "REAL"),
+        ("candidate_verticals", "TEXT"),
+    ]:
+        ensure_column(conn, "brands", col, coltype)
+
+
+def ensure_creator_vectors_table(conn: sqlite3.Connection) -> None:
+    conn.execute(
+        """
+        CREATE TABLE IF NOT EXISTS creator_vectors (
+            podcastindex_id INTEGER PRIMARY KEY,
+            embedding TEXT,
+            created_at DATETIME DEFAULT CURRENT_TIMESTAMP
+        )
+        """
+    )
+
+
+def ensure_brand_vectors_table(conn: sqlite3.Connection) -> None:
+    conn.execute(
+        """
+        CREATE TABLE IF NOT EXISTS brand_vectors (
+            adlid INTEGER PRIMARY KEY,
+            embedding TEXT,
+            created_at DATETIME DEFAULT CURRENT_TIMESTAMP
         )
         """
     )
@@ -580,18 +647,19 @@ def ingest_podcastindex_feeds(args: argparse.Namespace) -> int:
     source_db = Path(args.source_db)
     target_db = Path(args.target_db)
 
-    if not source_db.exists():
+    batch_size = args.batch_size
+    refresh_feeds = bool(getattr(args, "refresh_feeds", False))
+    if refresh_feeds and not source_db.exists():
         print(f"❌ Source DB not found: {source_db}", file=sys.stderr)
         return 1
 
-    batch_size = args.batch_size
-    print(f"🔄 Ingesting from {source_db} -> {target_db} (batch size {batch_size})")
+    if refresh_feeds:
+        print(f"🔄 Refreshing feeds from {source_db} -> {target_db} (batch size {batch_size})")
+    else:
+        print(f"🔄 Populating creators from existing feeds in {target_db} (batch size {batch_size})")
 
-    src = sqlite3.connect(source_db, timeout=10)
-    src.row_factory = sqlite3.Row
     tgt = sqlite3.connect(target_db, timeout=10)
     tgt.row_factory = sqlite3.Row
-    configure_sqlite(src)
     configure_sqlite(tgt)
 
     try:
@@ -602,116 +670,143 @@ def ingest_podcastindex_feeds(args: argparse.Namespace) -> int:
         ensure_column(tgt, "creator_enrichment", "source_social_instagram", "TEXT")
         ensure_column(tgt, "creator_enrichment", "source_social_website", "TEXT")
         ensure_column(tgt, "creator_enrichment", "source_social_patreon", "TEXT")
+        # New creator metadata columns
+        for col in [
+            ("vertical", "TEXT"),
+            ("audience_profile", "TEXT"),
+            ("industry_keywords", "TEXT"),
+            ("business_functions", "TEXT"),
+            ("pain_points", "TEXT"),
+            ("geo_focus", "TEXT"),
+            ("title", "TEXT"),
+            ("description", "TEXT"),
+            ("feed_url", "TEXT"),
+            ("web_link", "TEXT"),
+            ("categories", "TEXT"),
+            ("newestItemPubdate", "INTEGER"),
+            ("oldestItemPubdate", "INTEGER"),
+            ("episodeCount", "INTEGER"),
+            ("updateFrequency", "INTEGER"),
+        ]:
+            ensure_column(tgt, "creators", col[0], col[1])
 
-        existing_podcastindex_ids = {
-            row[0] for row in tgt.execute("SELECT id FROM podcastindex_feeds")
-        }
+        inserted_feeds = 0
+        inserted_creators = 0
+
+        if refresh_feeds:
+            src = sqlite3.connect(source_db, timeout=10)
+            src.row_factory = sqlite3.Row
+            configure_sqlite(src)
+            try:
+                existing_ids = {row[0] for row in tgt.execute("SELECT id FROM podcastindex_feeds")}
+                placeholders = ",".join("?" for _ in PODCASTINDEX_COLUMNS)
+                feed_sql = f"""
+                    INSERT OR REPLACE INTO podcastindex_feeds ({','.join(PODCASTINDEX_COLUMNS)})
+                    VALUES ({placeholders})
+                """
+                total_processed = 0
+                src_cursor = src.execute("SELECT * FROM podcasts")
+                while True:
+                    rows = src_cursor.fetchmany(batch_size)
+                    if not rows:
+                        break
+                    feed_rows = []
+                    for row in rows:
+                        podcastindex_id = row["id"]
+                        feed_rows.append(tuple(row[col] for col in PODCASTINDEX_COLUMNS))
+                        if podcastindex_id not in existing_ids:
+                            inserted_feeds += 1
+                            existing_ids.add(podcastindex_id)
+                    if feed_rows:
+                        tgt.executemany(feed_sql, feed_rows)
+                        tgt.commit()
+                    total_processed += len(rows)
+                    if total_processed % (batch_size * 5) == 0:
+                        print(
+                            f"Feeds pass: processed {total_processed:,} rows | "
+                            f"inserted/updated feeds: {inserted_feeds:,}"
+                        )
+                print(f"✅ Feeds refresh complete. Total feeds inserted/updated: {inserted_feeds:,}")
+            finally:
+                src.close()
+
+        # Step 2: filter feeds -> creators (always runs)
         existing_creators_by_pid = {
             row[0] for row in tgt.execute("SELECT podcastindex_id FROM creators")
         }
-
-        print(
-            f"Existing podcastindex ids: {len(existing_podcastindex_ids)} | "
-            f"creators by podcastindex_id: {len(existing_creators_by_pid)}"
+        three_years_ago = int(time.time()) - 3 * 365 * 24 * 3600
+        filtered = tgt.execute(
+            """
+            SELECT *
+            FROM podcastindex_feeds
+            WHERE language LIKE '%en%'
+              AND (lastHttpStatus IS NULL OR lastHttpStatus = 200)
+              AND LENGTH(description) >= 50
+              AND newestItemPubdate IS NOT NULL
+              AND newestItemPubdate >= ?
+              AND episodeCount IS NOT NULL AND episodeCount >= 3
+            ORDER BY newestItemPubdate DESC
+            """,
+            (three_years_ago,),
         )
-
-        src_cursor = src.execute("SELECT * FROM podcasts")
-
-        placeholders = ",".join("?" for _ in PODCASTINDEX_COLUMNS)
-        feed_sql = f"""
-            INSERT OR IGNORE INTO podcastindex_feeds ({','.join(PODCASTINDEX_COLUMNS)})
-            VALUES ({placeholders})
-        """
         creator_sql = """
             INSERT OR IGNORE INTO creators (
-                podcastindex_id, podcastguid, itunesid, language
-            ) VALUES (?, ?, ?, ?)
+                podcastindex_id, podcastguid, itunesid, language,
+                title, description, feed_url, web_link, categories,
+                newestItemPubdate, oldestItemPubdate, episodeCount, updateFrequency
+            ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
         """
-
-        total_processed = 0
-        inserted_feeds = 0
-        inserted_creators = 0
-        skipped_existing = 0
-        skipped_non_en = 0
-
+        processed_filtered = 0
         while True:
-            rows = src_cursor.fetchmany(batch_size)
+            rows = filtered.fetchmany(batch_size)
             if not rows:
                 break
-
-            feed_rows = []
             creator_rows = []
-
             for row in rows:
-                podcastindex_id = row["id"]
-                podcastguid = row["podcastGuid"]
-                itunes_id = row["itunesId"]
-                lang = (row["language"] or "").lower()
-                if lang and "en" not in lang:
-                    skipped_non_en += 1
+                pid = row["id"]
+                if pid in existing_creators_by_pid:
                     continue
-
-                # Conflict check: if this podcastindex_id already exists with a different itunesId/podcastGuid, stop
-                if podcastindex_id in existing_podcastindex_ids:
-                    existing_row = tgt.execute(
-                        "SELECT itunesId, podcastGuid FROM podcastindex_feeds WHERE id = ?",
-                        (podcastindex_id,),
-                    ).fetchone()
-                    if existing_row:
-                        existing_itunes_val = existing_row[0]
-                        existing_guid_val = existing_row[1]
-                        if (
-                            existing_itunes_val
-                            and itunes_id
-                            and existing_itunes_val != itunes_id
-                        ) or (
-                            existing_guid_val
-                            and podcastguid
-                            and existing_guid_val != podcastguid
-                        ):
-                            raise RuntimeError(
-                                f"Conflicting data for podcastindex_id {podcastindex_id}: "
-                                f"existing itunes {existing_itunes_val} vs {itunes_id}, "
-                                f"guid {existing_guid_val} vs {podcastguid}"
-                            )
-                    skipped_existing += 1
-                    continue
-
-                feed_rows.append(tuple(row[col] for col in PODCASTINDEX_COLUMNS))
-                existing_podcastindex_ids.add(podcastindex_id)
-                inserted_feeds += 1
-
-                if podcastindex_id not in existing_creators_by_pid:
-                    creator_rows.append(
-                        (
-                            podcastindex_id,
-                            podcastguid,
-                            itunes_id,
-                            row["language"],
-                        )
+                categories = []
+                for key in ("category1", "category2", "category3", "category4", "category5", "category6", "category7", "category8", "category9", "category10"):
+                    if row[key]:
+                        categories.append(row[key])
+                categories_text = ", ".join(categories) if categories else None
+                creator_rows.append(
+                    (
+                        pid,
+                        row["podcastGuid"],
+                        row["itunesId"],
+                        row["language"],
+                        row["title"],
+                        row["description"],
+                        row["url"],
+                        row["link"],
+                        categories_text,
+                        row["newestItemPubdate"],
+                        row["oldestItemPubdate"],
+                        row["episodeCount"],
+                        row["updateFrequency"],
                     )
-                    existing_creators_by_pid.add(podcastindex_id)
-                    inserted_creators += 1
-
-            if feed_rows:
-                tgt.executemany(feed_sql, feed_rows)
+                )
+                existing_creators_by_pid.add(pid)
+                inserted_creators += 1
             if creator_rows:
                 tgt.executemany(creator_sql, creator_rows)
-            tgt.commit()
-
-            total_processed += len(rows)
-            print(
-                f"Processed {total_processed:,} rows | inserted feeds: {inserted_feeds:,} | "
-                f"inserted creators: {inserted_creators:,} | skipped existing: {skipped_existing:,}"
-            )
+                tgt.commit()
+            processed_filtered += len(rows)
+            if processed_filtered % (batch_size * 5) == 0:
+                print(
+                    f"Creators pass: processed {processed_filtered:,} filtered rows | "
+                    f"inserted creators: {inserted_creators:,}"
+                )
 
         print(
-            f"✅ Done. Inserted feeds: {inserted_feeds:,}; creators: {inserted_creators:,}; "
-            f"skipped existing podcastindex_id: {skipped_existing:,}; skipped non-en: {skipped_non_en:,}"
+            f"✅ Done. Feeds inserted/updated: {inserted_feeds:,}; "
+            f"creators inserted: {inserted_creators:,}"
         )
         return 0
     finally:
-        src.close()
+        tgt.close()
         tgt.close()
 
 
@@ -899,9 +994,17 @@ def fetch_apple_metadata(itunes_id: Optional[int], title: str) -> Dict:
         if not results:
             return {}
         best = results[0]
+        desc = (
+            best.get("description")
+            or best.get("longDescription")
+            or best.get("collectionDescription")
+            or ""
+        )
+        if desc and desc.lower() in ("notexplicit", "explicit"):
+            desc = ""
         return {
             "title": best.get("collectionName") or best.get("trackName"),
-            "description": best.get("description") or best.get("collectionExplicitness"),
+            "description": desc,
             "genres": best.get("genres"),
             "publisher": best.get("artistName"),
             "artistUrl": best.get("artistViewUrl"),
@@ -946,7 +1049,17 @@ def fetch_spotify_metadata(show_url: Optional[str], title: str) -> Dict:
             search_res.raise_for_status()
             items = search_res.json().get("shows", {}).get("items", [])
             if items:
-                show_id = items[0]["id"]
+                # pick best by title similarity
+                from difflib import SequenceMatcher
+
+                scored = []
+                for it in items:
+                    score = SequenceMatcher(None, title.lower(), (it.get("name") or "").lower()).ratio()
+                    scored.append((score, it))
+                scored.sort(reverse=True, key=lambda x: x[0])
+                top_score, top_item = scored[0]
+                if top_score >= 0.8:
+                    show_id = top_item["id"]
 
         if not show_id:
             return {"status": "not_found"}
@@ -959,6 +1072,13 @@ def fetch_spotify_metadata(show_url: Optional[str], title: str) -> Dict:
         )
         show_res.raise_for_status()
         show_data = show_res.json()
+
+        # Verify title match to avoid mismatches
+        if title:
+            from difflib import SequenceMatcher
+
+            if SequenceMatcher(None, title.lower(), (show_data.get("name") or "").lower()).ratio() < 0.8:
+                return {"status": "not_found"}
 
         ep_res = requests.get(
             f"https://api.spotify.com/v1/shows/{show_id}/episodes",
@@ -1146,6 +1266,7 @@ def build_text_block(
     spotify: Dict,
     youtube: Dict,
     social: Dict,
+    extracted: Optional[Dict] = None,
 ) -> Tuple[str, Dict]:
     # Compose raw sources
     raw_sources = {
@@ -1160,40 +1281,40 @@ def build_text_block(
             "instagram": (social.get("instagram") or {}) if social else {},
             "website_about": (social.get("website") or {}).get("about") if social else None,
         },
+        "extracted_metadata": extracted or {},
     }
 
-    categories = []
-    for key in ("category1", "category2", "category3", "category4", "category5", "category6", "category7", "category8", "category9", "category10"):
-        val = base.get(key)
-        if val:
-            categories.append(val)
-    categories_text = ", ".join(categories)
+    def val(key: str) -> str:
+        if not extracted:
+            return ""
+        v = extracted.get(key)
+        return v if v else ""
 
-    episode_summary = ""
-    if spotify.get("episodes_sample"):
-        titles = [ep.get("name") or "" for ep in spotify["episodes_sample"] if ep]
-        episode_summary = "; ".join(titles[:20])
-
-    text_block = f"""TITLE:
+    text_block = f"""NAME:
 {apple.get('title') or spotify.get('title') or base.get('pi_title') or ''}
 
-DESCRIPTION:
-{apple.get('description') or spotify.get('description') or base.get('pi_description') or ''}
+SUMMARY:
+{val('summary')}
 
-CATEGORIES:
-{categories_text}
+VERTICAL:
+{val('vertical')}
 
-EPISODE_SUMMARY:
-{episode_summary}
+AUDIENCE:
+{val('audience_profile')}
 
-YOUTUBE_ABOUT:
-{youtube.get('about') or ''}
+FUNCTIONS:
+{val('business_functions')}
 
-YOUTUBE_COMMENTS:
-{youtube.get('comments') or ''}
+USE_CASES:
 
-HOST_BIO:
-{social.get('bio') or ''}
+KEYWORDS:
+{val('industry_keywords')}
+
+PAIN_POINTS:
+{val('pain_points')}
+
+GEO:
+{val('geo_focus')}
 """
     cleaned = clean_text_block(text_block)
     # Cap length to avoid runaway blobs
@@ -1228,6 +1349,15 @@ def enrich_creators(args: argparse.Namespace) -> int:
         ensure_column(conn, "creator_enrichment", "source_social_instagram", "TEXT")
         ensure_column(conn, "creator_enrichment", "source_social_website", "TEXT")
         ensure_column(conn, "creator_enrichment", "source_social_patreon", "TEXT")
+        for col in [
+            ("vertical", "TEXT"),
+            ("audience_profile", "TEXT"),
+            ("industry_keywords", "TEXT"),
+            ("business_functions", "TEXT"),
+            ("pain_points", "TEXT"),
+            ("geo_focus", "TEXT"),
+        ]:
+            ensure_column(conn, "creators", col[0], col[1])
 
         requested_sources = None
         if args.sources:
@@ -1237,6 +1367,8 @@ def enrich_creators(args: argparse.Namespace) -> int:
         disabled_sources = set()
 
         cursor = conn.cursor()
+        pidrange = args.pidrange
+
         if args.only_id:
             cursor.execute(
                 """
@@ -1255,8 +1387,12 @@ def enrich_creators(args: argparse.Namespace) -> int:
                 (args.only_id,),
             )
         else:
-            cursor.execute(
-                """
+            range_clause = ""
+            params = []
+            if pidrange:
+                range_clause = "WHERE c.podcastindex_id BETWEEN ? AND ?"
+                params.extend([pidrange[0], pidrange[1]])
+            query = f"""
                 SELECT c.podcastindex_id, c.itunesid, c.language,
                        p.url as feed_url, p.link as web_link, p.title as pi_title, p.description as pi_description,
                        p.category1, p.category2, p.category3, p.category4, p.category5,
@@ -1267,9 +1403,17 @@ def enrich_creators(args: argparse.Namespace) -> int:
                 FROM creators c
                 LEFT JOIN podcastindex_feeds p ON c.podcastindex_id = p.id
                 LEFT JOIN creator_enrichment ce ON ce.podcastindex_id = c.podcastindex_id
+                {range_clause}
+                ORDER BY
+                    p.newestItemPubdate DESC NULLS LAST,
+                    p.episodeCount DESC NULLS LAST,
+                    COALESCE(p.updateFrequency, 999999) ASC
                 LIMIT ? OFFSET ?
-                """,
-                (args.limit * 5, args.offset),
+            """
+            params.extend([args.limit * 5, args.offset])
+            cursor.execute(
+                query,
+                params,
             )
 
         raw_rows = cursor.fetchall()
@@ -1406,6 +1550,8 @@ def enrich_creators(args: argparse.Namespace) -> int:
 
             spotify_fetched = fetch_spotify_flag
             youtube_fetched = fetch_youtube_flag
+            if idx % 5 == 1 or idx == 1:
+                print(f"[{idx}/{len(rows)}] pid={podcastindex_id} fetching sources…", end="\r")
             spotify_meta = existing_spotify if not fetch_spotify_flag else fetch_spotify_metadata(spotify_url, title_for_lookup)
             apple_meta = existing_apple if not fetch_apple_flag else fetch_apple_metadata(itunes_id, title_for_lookup)
             youtube_meta = existing_youtube if not fetch_youtube_flag else fetch_youtube_metadata(title_for_lookup, mode="lean")
@@ -1471,12 +1617,32 @@ def enrich_creators(args: argparse.Namespace) -> int:
             else:
                 stats["youtube_not_found"] += 1
 
+            # Build combined raw text for metadata extraction
+            raw_pieces = []
+            for val in [
+                base.get("pi_description"),
+                apple_meta.get("description"),
+                (spotify_meta.get("show", {}) if spotify_meta else {}).get("description"),
+                (youtube_meta.get("channel", {}) if youtube_meta else {}).get("about"),
+                (social_meta.get("website") or {}).get("about") if social_meta else None,
+            ]:
+                if val:
+                    raw_pieces.append(val)
+            # Episode titles for extra signal
+            if spotify_meta.get("episodes_sample"):
+                ep_titles = [ep.get("name") or "" for ep in spotify_meta["episodes_sample"] if ep]
+                raw_pieces.append("; ".join(ep_titles[:30]))
+            combined_raw = "\n\n".join(raw_pieces) if raw_pieces else ""
+
+            if idx % 5 == 1 or idx == 1:
+                print(f"[{idx}/{len(rows)}] pid={podcastindex_id} running GPT extract…", end="\r")
             cleaned_text, raw_sources = build_text_block(
                 base=base,
                 apple=apple_meta,
                 spotify=spotify_meta,
                 youtube=youtube_meta,
                 social=social_meta,
+                extracted=extract_creator_metadata(combined_raw) if combined_raw else {},
             )
 
             uk_score = compute_uk_score(base, apple_meta, spotify_meta, youtube_meta, social_meta)
@@ -1503,6 +1669,25 @@ def enrich_creators(args: argparse.Namespace) -> int:
                     json.dumps(raw_sources),
                 ),
             )
+            # Persist structured creator metadata onto creators table
+            extracted = raw_sources.get("extracted_metadata") or {}
+            if extracted:
+                conn.execute(
+                    """
+                    UPDATE creators
+                    SET vertical = ?, audience_profile = ?, industry_keywords = ?, business_functions = ?, pain_points = ?, geo_focus = ?
+                    WHERE podcastindex_id = ?
+                    """,
+                    (
+                        extracted.get("vertical"),
+                        extracted.get("audience_profile"),
+                        extracted.get("industry_keywords"),
+                        extracted.get("business_functions"),
+                        extracted.get("pain_points"),
+                        extracted.get("geo_focus"),
+                        podcastindex_id,
+                    ),
+                )
             enriched_rows += 1
             if enriched_rows % 10 == 0:
                 conn.commit()
@@ -1636,6 +1821,8 @@ def clean_bio_text(text: str, max_len: int = 500) -> Optional[str]:
         "business inquiries",
         "subscribe",
         "shop",
+        "http",
+        "https",
     ]
     for b in boiler:
         text = re.sub(b, " ", text, flags=re.IGNORECASE)
@@ -1659,7 +1846,9 @@ def extract_social_candidates(base: Dict, apple: Dict, spotify: Dict, youtube: D
         urls.extend(re.findall(r"https?://\S+", t))
     # Base links
     if base.get("feed_url"):
-        urls.append(base["feed_url"])
+        # avoid feed URLs for social scraping
+        if not any(tag in base["feed_url"].lower() for tag in ["feedburner", ".xml", "rss"]):
+            urls.append(base["feed_url"])
     if base.get("web_link"):
         urls.append(base["web_link"])
     # Apple URLs
@@ -1695,7 +1884,8 @@ def fetch_twitter_bio(url: str) -> Optional[Dict]:
                 time.sleep(backoff)
                 backoff *= 2
                 continue
-            soup = BeautifulSoup(res.text, "html.parser")
+            parser = "xml" if "xml" in (res.headers.get("Content-Type") or "").lower() else "html.parser"
+            soup = BeautifulSoup(res.text, parser)
             meta = soup.find("meta", attrs={"name": "description"})
             if meta and meta.get("content"):
                 bio = clean_bio_text(meta["content"])
@@ -1719,7 +1909,8 @@ def fetch_instagram_bio(url: str) -> Optional[Dict]:
                 time.sleep(backoff)
                 backoff *= 2
                 continue
-            soup = BeautifulSoup(res.text, "html.parser")
+            parser = "xml" if "xml" in (res.headers.get("Content-Type") or "").lower() else "html.parser"
+            soup = BeautifulSoup(res.text, parser)
             meta = soup.find("meta", property="og:description")
             if meta and meta.get("content"):
                 desc = meta["content"]
@@ -1750,7 +1941,8 @@ def fetch_website_about(url: str) -> Optional[Dict]:
                 res = requests.get(t, timeout=10)
                 if res.status_code != 200:
                     continue
-                soup = BeautifulSoup(res.text, "html.parser")
+                parser = "xml" if "xml" in (res.headers.get("Content-Type") or "").lower() else "html.parser"
+                soup = BeautifulSoup(res.text, parser)
                 paragraphs = [p.get_text(" ", strip=True) for p in soup.find_all("p")]
                 text = " ".join(paragraphs)
                 bio = clean_bio_text(text, max_len=500)
@@ -1789,7 +1981,13 @@ def scrape_website_text(url: str) -> Tuple[str, List[str]]:
     try:
         res = requests.get(url, timeout=15)
         res.raise_for_status()
-        soup = BeautifulSoup(res.text, "html.parser")
+        parser = "xml" if "xml" in (res.headers.get("Content-Type") or "").lower() else "html.parser"
+        try:
+            soup = BeautifulSoup(res.text, parser)
+        except Exception as exc:
+            print(f"⚠️ Parser issue for {url} (parser={parser}): {exc}", file=sys.stderr)
+            # Fallback to html parser if xml failed
+            soup = BeautifulSoup(res.text, "html.parser")
         for tag in soup(["script", "style", "nav", "footer"]):
             tag.decompose()
         text = soup.get_text(" ", strip=True)
@@ -1808,7 +2006,8 @@ def scrape_linkedin_about(url: str) -> str:
         res = requests.get(url, timeout=15)
         if res.status_code != 200:
             return ""
-        soup = BeautifulSoup(res.text, "html.parser")
+        parser = "xml" if "xml" in (res.headers.get("Content-Type") or "").lower() else "html.parser"
+        soup = BeautifulSoup(res.text, parser)
         meta = soup.find("meta", attrs={"name": "description"})
         if meta and meta.get("content"):
             return meta["content"][:2000]
@@ -1849,22 +2048,23 @@ def extract_brand_fields(website_text: str, linkedin_text: str) -> Dict:
     if not client:
         return {}
     material = f"{website_text}\n\n{linkedin_text}"
-    if len(material) > 12000:
-        material = material[:12000]
+    if len(material) > 8000:
+        material = material[:8000]
     prompt = (
-        "You are an information extraction system.\n\n"
-        "Extract the following fields from the brand materials below.\n"
-        "Write CLEAR, SHORT, HIGH-SIGNAL text. No marketing fluff.\n"
-        "Output in JSON ONLY.\n\n"
-        "FIELDS TO EXTRACT:\n"
-        "- brand_name (max 5 words)\n"
-        "- description (1–3 sentences, plain meaning)\n"
-        "- product_category (1 line, e.g. \"SaaS / ERP / ecommerce tech\")\n"
-        "- target_audience (1–2 sentences)\n"
-        "- tone (5 adjectives max)\n"
-        "- key_themes (comma-separated keywords)\n"
-        "- goals (optional, 1 line: brand's marketing goals if clear)\n\n"
-        "BRAND MATERIAL BELOW:\n"
+        "Extract structured metadata for a brand. Write SHORT, HIGH-SIGNAL content only. Output JSON with keys:\n"
+        "- brand_vertical\n"
+        "- brand_audience_profile\n"
+        "- brand_use_cases\n"
+        "- brand_pain_points\n"
+        "- brand_geo_focus\n"
+        "- summary (2–4 sentences on what the product does and for whom)\n"
+        "- keywords (comma-separated business concepts)\n"
+        "- flag_inconsistent_positioning (true/false if positioning seems contradictory)\n"
+        "- candidate_verticals (array)\n"
+        "- recommended_vertical\n"
+        "- recommended_confidence (0..1)\n"
+        "Identify if website text appears MRP/manufacturing vs ecommerce-op. If signals conflict, set flag_inconsistent_positioning=true.\n\n"
+        "Input:\n"
         f"{material}"
     )
     try:
@@ -1888,6 +2088,85 @@ def extract_brand_fields(website_text: str, linkedin_text: str) -> Dict:
         return {}
 
 
+def extract_creator_metadata(raw_text: str) -> Dict:
+    """
+    Use GPT to extract structured creator metadata for embeddings.
+    """
+    key = os.getenv("OPENAI_API_KEY")
+    if not key:
+        return {}
+    client = OpenAI(api_key=key)
+    if len(raw_text) > 15000:
+        raw_text = raw_text[:15000]
+    prompt = (
+        "Extract structured metadata for a podcast.\n"
+        "Write SHORT, HIGH-SIGNAL content only. No fluff.\n"
+        "Output JSON with keys: vertical, audience_profile, industry_keywords, business_functions, pain_points, geo_focus, summary.\n"
+        "- vertical: main industry verticals (e.g., ecommerce, retail, supply chain)\n"
+        "- audience_profile: who listens (roles, industries, company stage)\n"
+        "- industry_keywords: comma-separated topical keywords\n"
+        "- business_functions: ops / marketing / tech / leadership etc.\n"
+        "- pain_points: problems listeners want to solve\n"
+        "- geo_focus: geography if clear (UK, US, global)\n"
+        "- summary: 2-4 sentence distilled summary of the show identity\n\n"
+        "Input text:\n"
+        f"{raw_text}"
+    )
+    try:
+        resp = client.chat.completions.create(
+            model="gpt-4o-mini",
+            messages=[{"role": "user", "content": prompt}],
+            temperature=0.2,
+            response_format={"type": "json_object"},
+        )
+        return json.loads(resp.choices[0].message.content)
+    except Exception as exc:
+        print(f"⚠️ Creator metadata extraction failed: {exc}", file=sys.stderr)
+        return {}
+
+
+def build_brand_text_block(row: sqlite3.Row) -> str:
+    def clip(val: Optional[str], max_len: int = 800) -> str:
+        if not val:
+            return ""
+        s = str(val)
+        if len(s) > max_len:
+            return s[:max_len]
+        return s
+
+    parts = []
+    parts.append(f"NAME: {clip(row['brand_name'])}")
+    parts.append(f"SUMMARY: {clip(row['brand_summary'] or row['extracted_description'])}")
+    vertical = row["brand_vertical_override"] or row["recommended_vertical"] or row["brand_vertical"] or row["extracted_product_category"]
+    parts.append(f"VERTICAL: {clip(vertical)}")
+    parts.append(f"AUDIENCE: {clip(row['brand_audience_profile'] or row['extracted_target_audience'])}")
+    parts.append(f"FUNCTIONS: ")
+    parts.append(f"USE_CASES: {clip(row['brand_use_cases'])}")
+    parts.append(f"PAIN_POINTS: {clip(row['brand_pain_points'] or row['extracted_goals'])}")
+    parts.append(f"KEYWORDS: {clip(row['brand_keywords'] or row['extracted_key_themes'])}")
+    parts.append(f"GEO: {clip(row['brand_geo_focus'])}")
+    return "\n".join(parts)
+
+
+def embed_text_block(text: str) -> Optional[List[float]]:
+    if not text:
+        return None
+    key = os.getenv("OPENAI_API_KEY")
+    if not key:
+        print("❌ OPENAI_API_KEY not set; cannot embed.", file=sys.stderr)
+        return None
+    client = OpenAI(api_key=key)
+    try:
+        resp = client.embeddings.create(
+            model="text-embedding-3-large",
+            input=text,
+        )
+        return resp.data[0].embedding
+    except Exception as exc:
+        print(f"⚠️ Embedding failed: {exc}", file=sys.stderr)
+        return None
+
+
 def ingest_brand(args: argparse.Namespace) -> int:
     db_path = Path(args.adl_db)
     if not db_path.exists():
@@ -1900,6 +2179,9 @@ def ingest_brand(args: argparse.Namespace) -> int:
 
     website_url = args.url
     website_text, links = scrape_website_text(website_url)
+    about = fetch_website_about(website_url)
+    if about and about.get("about"):
+        website_text = about["about"]
     socials = find_social_links(links)
 
     linkedin_text = ""
@@ -1935,13 +2217,25 @@ def ingest_brand(args: argparse.Namespace) -> int:
             return json.dumps(val)
         return str(val)
 
+    # Map extracted fields into both legacy extracted_* and new brand_* columns
+    ex_description = as_str(extracted.get("summary"))
+    ex_product_category = as_str(extracted.get("brand_vertical"))
+    ex_target = as_str(extracted.get("brand_audience_profile"))
+    ex_tone = None
+    ex_key_themes = as_str(extracted.get("keywords"))
+    ex_goals = as_str(extracted.get("brand_pain_points"))
+
     conn.execute(
         """
         INSERT INTO brands (
             brand_name, website_url, source_website_raw, source_linkedin_raw, source_social_raw,
             extracted_description, extracted_product_category, extracted_target_audience,
-            extracted_tone, extracted_key_themes, extracted_goals, created_at, updated_at
-        ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, CURRENT_TIMESTAMP, CURRENT_TIMESTAMP)
+            extracted_tone, extracted_key_themes, extracted_goals,
+            brand_vertical, brand_audience_profile, brand_use_cases, brand_pain_points, brand_geo_focus, brand_keywords, brand_summary,
+            brand_vertical_override, flag_inconsistent_positioning,
+            recommended_vertical, recommended_confidence, candidate_verticals,
+            created_at, updated_at
+        ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, CURRENT_TIMESTAMP, CURRENT_TIMESTAMP)
         ON CONFLICT(website_url) DO UPDATE SET
             brand_name=excluded.brand_name,
             source_website_raw=excluded.source_website_raw,
@@ -1953,26 +2247,496 @@ def ingest_brand(args: argparse.Namespace) -> int:
             extracted_tone=excluded.extracted_tone,
             extracted_key_themes=excluded.extracted_key_themes,
             extracted_goals=excluded.extracted_goals,
+            brand_vertical=excluded.brand_vertical,
+            brand_audience_profile=excluded.brand_audience_profile,
+            brand_use_cases=excluded.brand_use_cases,
+            brand_pain_points=excluded.brand_pain_points,
+            brand_geo_focus=excluded.brand_geo_focus,
+            brand_keywords=excluded.brand_keywords,
+            brand_summary=excluded.brand_summary,
+            brand_vertical_override=excluded.brand_vertical_override,
+            flag_inconsistent_positioning=excluded.flag_inconsistent_positioning,
+            recommended_vertical=excluded.recommended_vertical,
+            recommended_confidence=excluded.recommended_confidence,
+            candidate_verticals=excluded.candidate_verticals,
             updated_at=CURRENT_TIMESTAMP
         """,
         (
-            as_str(brand_name),
-            website_url,
-            website_text,
-            linkedin_text,
-            json.dumps(social_raw),
-            as_str(extracted.get("description")),
-            as_str(extracted.get("product_category")),
-            as_str(extracted.get("target_audience")),
-            as_str(extracted.get("tone")),
-            as_str(extracted.get("key_themes")),
-            as_str(extracted.get("goals")),
+            as_str(brand_name),          # brand_name
+            website_url,                 # website_url
+            website_text,                # source_website_raw
+            linkedin_text,               # source_linkedin_raw
+            json.dumps(social_raw),      # source_social_raw
+            ex_description,              # extracted_description
+            ex_product_category,         # extracted_product_category
+            ex_target,                   # extracted_target_audience
+            ex_tone,                     # extracted_tone
+            ex_key_themes,               # extracted_key_themes
+            ex_goals,                    # extracted_goals
+            as_str(extracted.get("brand_vertical")),          # brand_vertical
+            as_str(extracted.get("brand_audience_profile")),  # brand_audience_profile
+            as_str(extracted.get("brand_use_cases")),         # brand_use_cases
+            as_str(extracted.get("brand_pain_points")),       # brand_pain_points
+            as_str(extracted.get("brand_geo_focus")),         # brand_geo_focus
+            as_str(extracted.get("keywords")),                # brand_keywords
+            as_str(extracted.get("summary")),                 # brand_summary
+            None,                                             # brand_vertical_override (manual)
+            1 if extracted.get("flag_inconsistent_positioning") else 0,  # flag
+            as_str(extracted.get("recommended_vertical")),
+            float(extracted.get("recommended_confidence")) if extracted.get("recommended_confidence") is not None else None,
+            json.dumps(extracted.get("candidate_verticals")) if extracted.get("candidate_verticals") is not None else None,
         ),
     )
     conn.commit()
+    # Fetch inserted/updated row for optional test output
+    row = conn.execute("SELECT * FROM brands WHERE website_url = ?", (website_url,)).fetchone()
+    adlid = row["adlid"] if row else None
     print(f"✅ Stored brand: {brand_name or website_url}")
+
+    if args.write_test and row and adlid:
+        out_dir = Path("tests")
+        out_dir.mkdir(parents=True, exist_ok=True)
+        txt_path = out_dir / f"test-enrich-brand-adlid-{adlid}_cleaned.txt"
+        txt_path.write_text(build_brand_text_block(row))
+        print(f"📝 Wrote {txt_path}")
     conn.close()
     return 0
+
+
+def embed_entities(args: argparse.Namespace) -> int:
+    db_path = Path(args.adl_db)
+    if not db_path.exists():
+        print(f"❌ DB not found: {db_path}", file=sys.stderr)
+        return 1
+    conn = sqlite3.connect(db_path, timeout=10)
+    conn.row_factory = sqlite3.Row
+    configure_sqlite(conn)
+    ensure_creator_vectors_table(conn)
+    ensure_brand_vectors_table(conn)
+    ensure_creator_enrichment_table(conn)
+    ensure_brands_table(conn)
+
+    target = args.target
+    limit = args.limit
+    offset = args.offset
+    only_id = args.only_id
+    force = getattr(args, "force", False)
+    refreshall = getattr(args, "refreshall", False)
+
+    if target == "creators":
+        cursor = conn.cursor()
+        if refreshall:
+            confirm = input("Type YES to delete all creator vectors: ").strip()
+            if confirm != "YES":
+                print("Aborted.")
+                conn.close()
+                return 1
+            conn.execute("DELETE FROM creator_vectors")
+            conn.commit()
+            print("🗑️ Deleted all creator vectors.")
+        if only_id:
+            cursor.execute(
+                """
+                SELECT ce.podcastindex_id, ce.cleaned_text_block
+                FROM creator_enrichment ce
+                WHERE ce.podcastindex_id = ?
+                """,
+                (only_id,),
+            )
+        else:
+            cursor.execute(
+                """
+                SELECT ce.podcastindex_id, ce.cleaned_text_block,
+                       ce.source_spotify, ce.source_apple, ce.source_youtube
+                FROM creator_enrichment ce
+                LEFT JOIN creator_vectors cv ON cv.podcastindex_id = ce.podcastindex_id
+                WHERE cv.embedding IS NULL
+                LIMIT ? OFFSET ?
+                """,
+                (limit, offset),
+            )
+        rows = cursor.fetchall()
+        if not rows:
+            print("No creators to embed.")
+            conn.close()
+            return 0
+        embedded = 0
+        for r in rows:
+            if not force:
+                if not r["source_spotify"] or not r["source_apple"] or not r["source_youtube"]:
+                    continue
+            vec = embed_text_block(r["cleaned_text_block"] or "")
+            if not vec:
+                continue
+            conn.execute(
+                """
+                INSERT OR REPLACE INTO creator_vectors (podcastindex_id, embedding, created_at)
+                VALUES (?, ?, CURRENT_TIMESTAMP)
+                """,
+                (r["podcastindex_id"], json.dumps(vec)),
+            )
+            embedded += 1
+            if embedded % 10 == 0:
+                conn.commit()
+                print(f"Embedded {embedded}/{len(rows)} creators (last id={r['podcastindex_id']})")
+        conn.commit()
+        print(f"✅ Embedded {embedded} creators.")
+        conn.close()
+        return 0
+
+    if target == "brands":
+        cursor = conn.cursor()
+        if refreshall:
+            confirm = input("Type YES to delete all brand vectors: ").strip()
+            if confirm != "YES":
+                print("Aborted.")
+                conn.close()
+                return 1
+            conn.execute("DELETE FROM brand_vectors")
+            conn.commit()
+            print("🗑️ Deleted all brand vectors.")
+        if only_id:
+            cursor.execute(
+                "SELECT * FROM brands WHERE adlid = ?",
+                (only_id,),
+            )
+        else:
+            cursor.execute(
+                """
+                SELECT b.*
+                FROM brands b
+                LEFT JOIN brand_vectors bv ON bv.adlid = b.adlid
+                WHERE bv.embedding IS NULL
+                LIMIT ? OFFSET ?
+                """,
+                (limit, offset),
+            )
+        rows = cursor.fetchall()
+        if not rows:
+            print("No brands to embed.")
+            conn.close()
+            return 0
+        embedded = 0
+        for r in rows:
+            text_block = build_brand_text_block(r)
+            if not force:
+                # Require structured fields to avoid embedding noise
+                if not (r["brand_summary"] or r["extracted_description"]) or not (r["brand_vertical"] or r["extracted_product_category"]):
+                    continue
+            vec = embed_text_block(text_block)
+            if not vec:
+                continue
+            conn.execute(
+                """
+                INSERT OR REPLACE INTO brand_vectors (adlid, embedding, created_at)
+                VALUES (?, ?, CURRENT_TIMESTAMP)
+                """,
+                (r["adlid"], json.dumps(vec)),
+            )
+            embedded += 1
+            if embedded % 10 == 0:
+                conn.commit()
+                print(f"Embedded {embedded}/{len(rows)} brands (last id={r['adlid']})")
+        conn.commit()
+        print(f"✅ Embedded {embedded} brands.")
+        conn.close()
+        return 0
+
+    conn.close()
+    print(f"Unknown embed target: {target}")
+    return 1
+
+
+def test_compare(args: argparse.Namespace) -> int:
+    def load_text(txt: Optional[str], path: Optional[Path]) -> Optional[str]:
+        if txt:
+            return txt
+        if path and path.exists():
+            return path.read_text()
+        return None
+
+    t1 = load_text(args.text1, args.file1)
+    t2 = load_text(args.text2, args.file2)
+    if not t1 or not t2:
+        print("❌ Provide both inputs via --text1/--file1 and --text2/--file2", file=sys.stderr)
+        return 1
+
+    v1 = embed_text_block(t1)
+    v2 = embed_text_block(t2)
+    if not v1 or not v2:
+        print("❌ Failed to embed one or both inputs.", file=sys.stderr)
+        return 1
+
+    score = cosine_similarity(v1, v2)
+    print("TEST COMPARISON RESULT")
+    print("======================")
+    print(f"Similarity score: {score:.3f}")
+    print(f"Interpretation: {relevance_label(score)}")
+    return 0
+
+
+def export_entity(args: argparse.Namespace) -> int:
+    db_path = Path(args.adl_db)
+    if not db_path.exists():
+        print(f"❌ DB not found: {db_path}", file=sys.stderr)
+        return 1
+    target = args.target
+    entity_id = args.id
+    out_path = args.out or Path(f"tests/export-{target}-{entity_id}.txt")
+    out_path.parent.mkdir(parents=True, exist_ok=True)
+
+    conn = sqlite3.connect(db_path, timeout=10)
+    conn.row_factory = sqlite3.Row
+    configure_sqlite(conn)
+    try:
+        if target == "creator":
+            row = conn.execute(
+                "SELECT cleaned_text_block FROM creator_enrichment WHERE podcastindex_id = ?",
+                (entity_id,),
+            ).fetchone()
+            if not row or not row["cleaned_text_block"]:
+                print(f"❌ No cleaned_text_block found for creator pid={entity_id}", file=sys.stderr)
+                return 1
+            out_path.write_text(row["cleaned_text_block"])
+            print(f"📝 Exported creator pid={entity_id} cleaned block to {out_path}")
+            return 0
+        if target == "brand":
+            row = conn.execute(
+                "SELECT * FROM brands WHERE adlid = ?",
+                (entity_id,),
+            ).fetchone()
+            if not row:
+                print(f"❌ No brand found for adlid={entity_id}", file=sys.stderr)
+                return 1
+            text_block = build_brand_text_block(row)
+            out_path.write_text(text_block)
+            print(f"📝 Exported brand adlid={entity_id} cleaned block to {out_path}")
+            return 0
+        print(f"❌ Unknown target: {target}", file=sys.stderr)
+        return 1
+    finally:
+        conn.close()
+
+
+def test_enrich(args: argparse.Namespace) -> int:
+    db_path = Path(args.adl_db)
+    if not db_path.exists():
+        print(f"❌ DB not found: {db_path}", file=sys.stderr)
+        return 1
+    pid = args.pid
+    conn = sqlite3.connect(db_path, timeout=10)
+    conn.row_factory = sqlite3.Row
+    configure_sqlite(conn)
+    base_row = conn.execute(
+        """
+        SELECT p.id AS podcastindex_id,
+               p.title AS pi_title,
+               p.description AS pi_description,
+               p.url AS feed_url,
+               p.link AS web_link,
+               p.category1, p.category2, p.category3, p.category4, p.category5,
+               p.category6, p.category7, p.category8, p.category9, p.category10,
+               c.itunesid
+        FROM creators c
+        LEFT JOIN podcastindex_feeds p ON p.id = c.podcastindex_id
+        WHERE c.podcastindex_id = ?
+        """,
+        (pid,),
+    ).fetchone()
+    if not base_row:
+        print(f"❌ No creator/podcastindex row found for podcastindex_id={pid}", file=sys.stderr)
+        conn.close()
+        return 1
+
+    base = dict(base_row)
+    print(f"🔎 Test-enrich for podcastindex_id={pid} title='{base.get('pi_title') or ''}'")
+
+    title_for_lookup = base.get("pi_title") or ""
+    spotify_url = base.get("feed_url") if (base.get("feed_url") or "").startswith("https://open.spotify.com/show/") else None
+
+    print("→ Fetching Apple metadata...")
+    apple_meta = fetch_apple_metadata(base.get("itunesid"), title_for_lookup)
+    print("→ Fetching Spotify metadata...")
+    spotify_meta = fetch_spotify_metadata(spotify_url, title_for_lookup)
+    print("→ Fetching YouTube metadata...")
+    youtube_meta = fetch_youtube_metadata(title_for_lookup, mode="lean")
+    print("→ Fetching social bios...")
+    social_meta = fetch_social_bios_from_sources(base, apple_meta, spotify_meta, youtube_meta)
+
+    print("→ Building text block...")
+    raw_pieces = []
+    for val in [
+        base.get("pi_description"),
+        apple_meta.get("description"),
+        (spotify_meta.get("show", {}) if spotify_meta else {}).get("description"),
+        (youtube_meta.get("channel", {}) if youtube_meta else {}).get("about"),
+        (social_meta.get("website") or {}).get("about") if social_meta else None,
+    ]:
+        if val:
+            raw_pieces.append(val)
+    if spotify_meta.get("episodes_sample"):
+        ep_titles = [ep.get("name") or "" for ep in spotify_meta["episodes_sample"] if ep]
+        raw_pieces.append("; ".join(ep_titles[:30]))
+    combined_raw = "\n\n".join(raw_pieces)
+    summary = extract_creator_metadata(combined_raw) if combined_raw else {}
+    cleaned_text, raw_sources = build_text_block(
+        base=base,
+        apple=apple_meta,
+        spotify=spotify_meta,
+        youtube=youtube_meta,
+        social=social_meta,
+        extracted=summary,
+    )
+
+    out_dir = Path("tests")
+    out_dir.mkdir(parents=True, exist_ok=True)
+    base_name = f"test-enrich-pid-{pid}"
+    json_path = out_dir / f"{base_name}.json"
+    txt_path = out_dir / f"{base_name}_cleaned.txt"
+
+    payload = {
+        "podcastindex_id": pid,
+        "podcast_title": base.get("pi_title"),
+        "base": base,
+        "apple": apple_meta,
+        "spotify": spotify_meta,
+        "youtube": youtube_meta,
+        "social": social_meta,
+        "raw_text_sources": raw_sources,
+        "cleaned_text_block": cleaned_text,
+        "summary": summary,
+    }
+    json_path.write_text(json.dumps(payload, indent=2))
+    txt_path.write_text(cleaned_text or "")
+    print(f"✅ Wrote {json_path} and {txt_path}")
+    conn.close()
+    return 0
+
+
+def cosine_similarity(a: List[float], b: List[float]) -> float:
+    va = np.array(a, dtype=float)
+    vb = np.array(b, dtype=float)
+    denom = (np.linalg.norm(va) * np.linalg.norm(vb))
+    if denom == 0:
+        return 0.0
+    return float(np.dot(va, vb) / denom)
+
+
+def format_table(rows: List[Tuple[str, float, str, str]], header: Tuple[str, str, str, str]) -> str:
+    cols = list(zip(*([header] + rows)))
+    widths = [max(len(str(cell)) for cell in col) for col in cols]
+    def fmt_row(row):
+        return " | ".join(str(cell).ljust(widths[i]) for i, cell in enumerate(row))
+    sep = "-+-".join("-" * w for w in widths)
+    lines = [fmt_row(header), sep]
+    for r in rows:
+        lines.append(fmt_row(r))
+    return "\n".join(lines)
+
+
+def relevance_label(score: float) -> str:
+    if score >= 0.8:
+        return "strong"
+    if score >= 0.7:
+        return "medium"
+    return "weak"
+
+
+def rank_entities(args: argparse.Namespace) -> int:
+    db_path = Path(args.adl_db)
+    if not db_path.exists():
+        print(f"❌ DB not found: {db_path}", file=sys.stderr)
+        return 1
+    conn = sqlite3.connect(db_path, timeout=10)
+    conn.row_factory = sqlite3.Row
+    configure_sqlite(conn)
+    ensure_creator_vectors_table(conn)
+    ensure_brand_vectors_table(conn)
+
+    limit = args.limit
+    adlid = args.adlid
+
+    if args.bybrand:
+        brand = conn.execute("SELECT adlid, brand_name FROM brands WHERE adlid = ?", (adlid,)).fetchone()
+        if not brand:
+            print(f"❌ Brand adlid {adlid} not found.", file=sys.stderr)
+            return 1
+        bvec_row = conn.execute("SELECT embedding FROM brand_vectors WHERE adlid = ?", (adlid,)).fetchone()
+        if not bvec_row:
+            print(f"❌ No embedding for brand adlid {adlid}. Run embed brands first.", file=sys.stderr)
+            return 1
+        bvec = json.loads(bvec_row["embedding"])
+        creator_rows = conn.execute(
+            """
+            SELECT ce.podcastindex_id, ce.cleaned_text_block, pf.title AS name, cv.embedding
+            FROM creator_vectors cv
+            LEFT JOIN creator_enrichment ce ON ce.podcastindex_id = cv.podcastindex_id
+            LEFT JOIN podcastindex_feeds pf ON pf.id = ce.podcastindex_id
+            WHERE cv.embedding IS NOT NULL
+            """
+        ).fetchall()
+        scored = []
+        for r in creator_rows:
+            try:
+                cvec = json.loads(r["embedding"])
+            except Exception:
+                continue
+            score = cosine_similarity(bvec, cvec)
+            scored.append((f"{r['podcastindex_id']}|{r['name'] or ''}", score, relevance_label(score), ""))
+        scored.sort(key=lambda x: x[1], reverse=True)
+        rows = scored[:limit]
+        header = (f"Ranking by Brand: adlid={adlid}, brand=\"{brand['brand_name'] or ''}\"", "", "", "")
+        table = format_table(rows, ("podcast_title", "score", "relevance", "notes"))
+        print(header[0])
+        print(table)
+        return 0
+
+    if args.bycreator:
+        creator = conn.execute(
+            """
+            SELECT ce.podcastindex_id, pf.title AS name
+            FROM creators c
+            LEFT JOIN creator_enrichment ce ON ce.podcastindex_id = c.podcastindex_id
+            LEFT JOIN podcastindex_feeds pf ON pf.id = ce.podcastindex_id
+            WHERE c.podcastindex_id = ?
+            """,
+            (adlid,),
+        ).fetchone()
+        if not creator:
+            print(f"❌ Creator adlid {adlid} not found.", file=sys.stderr)
+            return 1
+        cvec_row = conn.execute(
+            "SELECT embedding FROM creator_vectors WHERE podcastindex_id = ?", (adlid,)
+        ).fetchone()
+        if not cvec_row:
+            print(f"❌ No embedding for creator adlid {adlid}. Run embed creators first.", file=sys.stderr)
+            return 1
+        cvec = json.loads(cvec_row["embedding"])
+        brand_rows = conn.execute(
+            """
+            SELECT b.adlid, b.brand_name, bv.embedding
+            FROM brand_vectors bv
+            LEFT JOIN brands b ON b.adlid = bv.adlid
+            WHERE bv.embedding IS NOT NULL
+            """
+        ).fetchall()
+        scored = []
+        for r in brand_rows:
+            try:
+                bvec = json.loads(r["embedding"])
+            except Exception:
+                continue
+            score = cosine_similarity(cvec, bvec)
+            scored.append((f"{r['adlid']}|{r['brand_name'] or ''}", score, relevance_label(score), ""))
+        scored.sort(key=lambda x: x[1], reverse=True)
+        rows = scored[:limit]
+        print(f"Ranking by Creator: adlid={adlid}, podcast=\"{creator['name'] or ''}\"")
+        table = format_table(rows, ("brand_name", "score", "relevance", "notes"))
+        print(table)
+        return 0
+
+    print("❌ Must specify --bybrand or --bycreator", file=sys.stderr)
+    return 1
 
 
 def parse_args(argv: Optional[Sequence[str]] = None) -> argparse.Namespace:
@@ -2032,6 +2796,11 @@ def parse_args(argv: Optional[Sequence[str]] = None) -> argparse.Namespace:
         help="Path to target Adelined SQLite database (default: adelined_matching.db)",
     )
     ingest_parser.add_argument(
+        "--refresh-feeds",
+        action="store_true",
+        help="Refresh podcastindex_feeds from the source DB before filtering into creators (default: use existing feeds only)",
+    )
+    ingest_parser.add_argument(
         "--batch-size",
         type=int,
         default=5000,
@@ -2061,6 +2830,13 @@ def parse_args(argv: Optional[Sequence[str]] = None) -> argparse.Namespace:
         "--only-id",
         type=int,
         help="Optional specific podcastindex_id to process",
+    )
+    enrich_parser.add_argument(
+        "--pidrange",
+        nargs=2,
+        type=int,
+        metavar=("START_PID", "END_PID"),
+        help="Optional inclusive podcastindex_id range to process (START_PID END_PID)",
     )
     enrich_parser.add_argument(
         "--sources",
@@ -2160,6 +2936,119 @@ def parse_args(argv: Optional[Sequence[str]] = None) -> argparse.Namespace:
         default=Path("adelined_matching.db"),
         help="Path to Adelined SQLite database (default: adelined_matching.db)",
     )
+    brand_parser.add_argument(
+        "--write-test",
+        action="store_true",
+        help="Write test brand embedding text to tests/test-enrich-brand-adlid-<id>_cleaned.txt",
+    )
+
+    embed_parser = subparsers.add_parser("embed", help="Generate embeddings")
+    embed_parser.add_argument(
+        "target",
+        choices=["creators", "brands"],
+        help="What to embed",
+    )
+    embed_parser.add_argument(
+        "--adl-db",
+        type=Path,
+        default=Path("adelined_matching.db"),
+        help="Path to Adelined SQLite database (default: adelined_matching.db)",
+    )
+    embed_parser.add_argument(
+        "--limit",
+        type=int,
+        default=100,
+        help="Max rows to embed (default: 100)",
+    )
+    embed_parser.add_argument(
+        "--offset",
+        type=int,
+        default=0,
+        help="Offset rows (default: 0)",
+    )
+    embed_parser.add_argument(
+        "--only-id",
+        type=int,
+        help="Embed only this podcastindex_id (for creators) or adlid (for brands)",
+    )
+    embed_parser.add_argument(
+        "--force",
+        action="store_true",
+        help="Embed even if required sources are missing",
+    )
+    embed_parser.add_argument(
+        "--refreshall",
+        action="store_true",
+        help="Delete existing vectors for the chosen target before embedding (requires typing YES)",
+    )
+
+    export_parser = subparsers.add_parser("export", help="Export a stored embedding text block to a file")
+    export_parser.add_argument(
+        "--target",
+        required=True,
+        choices=["creator", "brand"],
+        help="Which entity to export",
+    )
+    export_parser.add_argument(
+        "--id",
+        required=True,
+        type=int,
+        help="podcastindex_id for creator or adlid for brand",
+    )
+    export_parser.add_argument(
+        "--out",
+        type=Path,
+        help="Output file path (default: tests/export-<target>-<id>.txt)",
+    )
+    export_parser.add_argument(
+        "--adl-db",
+        type=Path,
+        default=Path("adelined_matching.db"),
+        help="Path to Adelined SQLite database (default: adelined_matching.db)",
+    )
+
+    rank_parser = subparsers.add_parser("rank", help="Rank creators vs brands via embeddings")
+    rank_mode = rank_parser.add_mutually_exclusive_group(required=True)
+    rank_mode.add_argument("--bybrand", action="store_true", help="Rank creators for a brand")
+    rank_mode.add_argument("--bycreator", action="store_true", help="Rank brands for a creator")
+    rank_parser.add_argument(
+        "--adlid",
+        type=int,
+        required=True,
+        help="adlid of the brand (when --bybrand) or creator (when --bycreator)",
+    )
+    rank_parser.add_argument(
+        "--adl-db",
+        type=Path,
+        default=Path("adelined_matching.db"),
+        help="Path to Adelined SQLite database (default: adelined_matching.db)",
+    )
+    rank_parser.add_argument(
+        "--limit",
+        type=int,
+        default=20,
+        help="Number of top results to show (default: 20)",
+    )
+
+    test_compare = subparsers.add_parser("test-compare", help="Compare two text inputs via embeddings")
+    test_compare.add_argument("--text1", help="First text input")
+    test_compare.add_argument("--text2", help="Second text input")
+    test_compare.add_argument("--file1", type=Path, help="Path to first text file")
+    test_compare.add_argument("--file2", type=Path, help="Path to second text file")
+
+    test_enrich = subparsers.add_parser("test-enrich", help="Dump enrichment for a creator")
+    test_enrich.add_argument(
+        "--pid",
+        type=int,
+        required=True,
+        help="podcastindex_id (from creators) to inspect",
+    )
+    test_enrich.add_argument(
+        "--adl-db",
+        type=Path,
+        default=Path("adelined_matching.db"),
+        help="Path to Adelined SQLite database (default: adelined_matching.db)",
+    )
 
     return parser.parse_args(argv)
 
@@ -2247,6 +3136,16 @@ def main(argv: Optional[Sequence[str]] = None) -> int:
             return discover_apple(args)
     if args.action == "brand":
         return ingest_brand(args)
+    if args.action == "embed":
+        return embed_entities(args)
+    if args.action == "rank":
+        return rank_entities(args)
+    if args.action == "test-compare":
+        return test_compare(args)
+    if args.action == "test-enrich":
+        return test_enrich(args)
+    if args.action == "export":
+        return export_entity(args)
     print(f"Unknown action/source combination: {args.action} {args.source}")
     return 1
 
@@ -2265,6 +3164,11 @@ Commands:
   python3 adl enrichment show [options]
   python3 adl enrichment summary [options]
   python3 adl brand --url <website>
+  python3 adl embed [creators|brands] [options]
+  python3 adl rank --bybrand/--bycreator --adlid <id> [options]
+  python3 adl test-compare --text1/--file1 --text2/--file2
+  python3 adl test-enrich --pid <podcastindex_id>
+  python3 adl export --target creator|brand --id <id> [--out path]
 
 Examples:
   # YouTube: fetch channel metadata by handles
@@ -2290,6 +3194,9 @@ Examples:
   python3 adl enrich --adl-db adelined_matching.db --only-id 12345
   # Ingest a brand (scrape + GPT extract)
   python3 adl brand --url https://brandsite.com
+  # Embed creators or brands (OpenAI embedding)
+  python3 adl embed creators --adl-db adelined_matching.db --limit 100
+  python3 adl embed brands --adl-db adelined_matching.db --limit 50
 Options:
   --output    Optional JSON file to write scraped records
   --source-db Source SQLite path for ingest (default: data/podcastindex_feeds.db)
@@ -2300,6 +3207,8 @@ Options:
   --only-id   Enrich only this podcastindex_id
   --limit-per-term Apple discovery results per page (default: 200)
   --max-pages     Apple discovery max pages per term (default: 5)
+  --limit     Max rows to embed (default: 100)
+  --offset    Offset rows to embed (default: 0)
 """
     print(help_text.strip())
 
