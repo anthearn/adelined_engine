@@ -187,19 +187,6 @@ class YouTubeChannelFetcher:
         self.session = requests.Session()
         self.session.headers.update({"User-Agent": user_agent})
 
-
-class YouTubeChannelFetcher:
-    def __init__(
-        self,
-        channels: Sequence[str],
-        delay: float = 1.0,
-        user_agent: str = "Mozilla/5.0 AdelinedBot/0.1",
-    ):
-        self.channels = channels
-        self.delay = delay
-        self.session = requests.Session()
-        self.session.headers.update({"User-Agent": user_agent})
-
     def fetch(self) -> List[YouTubeChannelRecord]:
         results: List[YouTubeChannelRecord] = []
         for raw in self.channels:
@@ -725,7 +712,8 @@ def show_enrichment(args: argparse.Namespace) -> int:
         if not args.source:
             cur = conn.execute(
                 """
-                SELECT ce.podcastindex_id, ce.source_spotify, ce.source_apple, ce.source_youtube, ce.source_social,
+                SELECT ce.podcastindex_id, ce.source_spotify, ce.source_apple, ce.source_youtube,
+                       ce.source_social_twitter, ce.source_social_instagram, ce.source_social_website, ce.source_social_patreon,
                        pf.title as name
                 FROM creator_enrichment ce
                 LEFT JOIN podcastindex_feeds pf ON pf.id = ce.podcastindex_id
@@ -741,12 +729,50 @@ def show_enrichment(args: argparse.Namespace) -> int:
                 spotify_j = load_json(row["source_spotify"])
                 apple_j = load_json(row["source_apple"])
                 youtube_j = load_json(row["source_youtube"])
-                social_j = load_json(row["source_social"])
+                socials_all = [
+                    load_json(row["source_social_twitter"]),
+                    load_json(row["source_social_instagram"]),
+                    load_json(row["source_social_website"]),
+                    load_json(row["source_social_patreon"]),
+                ]
+                social_count = sum(count_nonempty(s) for s in socials_all)
                 print(f"name: {row['name'] or 'N/A'}")
                 print(f"spotify: {count_nonempty(spotify_j)} data")
                 print(f"apple: {count_nonempty(apple_j)} data")
                 print(f"youtube: {count_nonempty(youtube_j)} data")
-                print(f"social: {count_nonempty(social_j)} data")
+                print(f"social: {social_count} data")
+                print("")
+            return 0
+
+        if args.source == "social":
+            cur = conn.execute(
+                """
+                SELECT ce.podcastindex_id, ce.source_social_twitter, ce.source_social_instagram,
+                       ce.source_social_website, ce.source_social_patreon, pf.title as name
+                FROM creator_enrichment ce
+                LEFT JOIN podcastindex_feeds pf ON pf.id = ce.podcastindex_id
+                LIMIT ?
+                """,
+                (args.limit,),
+            )
+            rows = cur.fetchall()
+            if not rows:
+                print("No rows with social data.")
+                return 0
+            for row in rows:
+                print(f"{row['name'] or row['podcastindex_id']}:")
+                for label, col in [
+                    ("twitter", "source_social_twitter"),
+                    ("instagram", "source_social_instagram"),
+                    ("website", "source_social_website"),
+                    ("patreon", "source_social_patreon"),
+                ]:
+                    data = load_json(row[col])
+                    if not data or not isinstance(data, dict):
+                        continue
+                    if count_nonempty(data) == 0:
+                        continue
+                    print(f"  {label}: {data}")
                 print("")
             return 0
 
@@ -754,7 +780,6 @@ def show_enrichment(args: argparse.Namespace) -> int:
             "spotify": "source_spotify",
             "apple": "source_apple",
             "youtube": "source_youtube",
-            "social": "source_social_twitter",
             "twitter": "source_social_twitter",
             "instagram": "source_social_instagram",
             "website": "source_social_website",
@@ -831,10 +856,33 @@ def summary_enrichment(args: argparse.Namespace) -> int:
                     count += 1
             return count
 
+        def count_any_social() -> int:
+            rows = conn.execute(
+                """
+                SELECT source_social_twitter, source_social_instagram, source_social_website, source_social_patreon
+                FROM creator_enrichment
+                """
+            ).fetchall()
+            count = 0
+            for r in rows:
+                blobs = [r["source_social_twitter"], r["source_social_instagram"], r["source_social_website"], r["source_social_patreon"]]
+                payload = False
+                for blob in blobs:
+                    try:
+                        d = json.loads(blob) if blob else {}
+                    except Exception:
+                        d = {}
+                    if has_payload(d):
+                        payload = True
+                        break
+                if payload:
+                    count += 1
+            return count
+
         spotify_ok = count_valid("source_spotify")
         apple_ok = count_valid("source_apple")
         youtube_ok = count_valid("source_youtube")
-        social_ok = count_valid("source_social")
+        social_ok = count_any_social()
 
         print(f"Total creators: {total_creators}")
         print(f"Enriched: {total_enriched} / {total_creators}")
@@ -1985,7 +2033,7 @@ def compute_uk_score(base: Dict, apple: Dict, spotify: Dict, youtube: Dict, soci
             str(base.get("pi_description") or ""),
             str(base.get("pi_title") or ""),
             str(apple.get("description") or ""),
-            str(spotify.get("description") or ""),
+            str((spotify.get("show", {}) if spotify else {}).get("description") or ""),
             str(youtube.get("channel", {}).get("about", "") if youtube else ""),
             str(social.get("website", {}).get("about", "") if social else ""),
         ]
@@ -2365,7 +2413,9 @@ def normalize_entity_to_json(entity_type: str, name: str, fields_text: str, cate
         "You are a classification and summarisation assistant.\n"
         "Normalize noisy marketing/technical text about an entity into a simple schema, using plain language a non-expert would understand.\n"
         "Return JSON ONLY with keys: summary, vertical, audience, pain_points, use_cases, themes, tone, geo, topics (array as specified).\n"
-        "Be concise, high-signal, no fluff. Use common industry labels.\n\n"
+        "Be concise, high-signal, no fluff. Use common industry labels.\n"
+        "If multiple positions appear, prefer the CURRENT go-to-market positioning.\n"
+        "Do not hallucinate missing facts; leave fields short and generic instead.\n\n"
         f"ENTITY_TYPE: {entity_type}\n"
         f"NAME: {name}\n"
         f"RAW FIELDS:\n{fields_text}\n\n"
@@ -2433,6 +2483,81 @@ def parse_embedding(text: str) -> Optional[List[float]]:
         return json.loads(text) if text else None
     except Exception:
         return None
+
+
+# ---- Lexicon / taxonomy helpers ----
+def map_label_from_lexicon(conn: sqlite3.Connection, raw_label: Optional[str]) -> Optional[str]:
+    if not raw_label:
+        return raw_label
+    raw = raw_label.strip()
+    if not raw:
+        return raw
+    row = conn.execute(
+        """
+        SELECT normalized_label
+        FROM normalization_lexicon
+        WHERE lower(raw_label) = lower(?)
+        LIMIT 1
+        """,
+        (raw,),
+    ).fetchone()
+    if row and row["normalized_label"]:
+        return row["normalized_label"]
+    return raw
+
+
+def simplify_entity_text(entity_type: str, name: str, raw_text: str) -> Optional[str]:
+    key = os.getenv("OPENAI_API_KEY")
+    if not key or not raw_text:
+        return raw_text
+    client = OpenAI(api_key=key)
+    prompt = (
+        "Rewrite the following noisy text into a short, plain-language description.\n"
+        "Keep only high-signal details: what it is, who it's for, core topics/offerings.\n"
+        "Remove navigation/UI/boilerplate, testimonials, pricing, CTA fluff.\n"
+        "Stay factual; do not invent missing details.\n\n"
+        f"ENTITY_TYPE: {entity_type}\n"
+        f"NAME: {name}\n"
+        f"RAW TEXT:\n{raw_text}\n"
+    )
+    try:
+        resp = client.chat.completions.create(
+            model="gpt-4o-mini",
+            messages=[{"role": "user", "content": prompt}],
+            temperature=0.2,
+        )
+        return resp.choices[0].message.content.strip()
+    except Exception:
+        return raw_text
+
+
+def map_topics_to_apple(conn: sqlite3.Connection, topics_val) -> str:
+    if not topics_val:
+        return ""
+    # If apple categories table empty, just serialize strings
+    has_cats = conn.execute("SELECT 1 FROM apple_podcast_categories LIMIT 1").fetchone()
+    if not has_cats:
+        if isinstance(topics_val, list):
+            return ",".join([t if isinstance(t, str) else t.get("apple_subcategory_name") or t.get("apple_category_name") or "" for t in topics_val])
+        return str(topics_val)
+    rows = conn.execute("SELECT name, full_path FROM apple_podcast_categories").fetchall()
+    names = {r["name"].lower(): r["full_path"] for r in rows}
+    collected: List[str] = []
+    if isinstance(topics_val, list):
+        for t in topics_val:
+            if isinstance(t, str):
+                key = t.lower()
+            else:
+                key = (t.get("apple_subcategory_name") or t.get("apple_category_name") or t.get("apple_category_id") or "").lower()
+            if key in names:
+                collected.append(names[key])
+            elif key:
+                collected.append(key)
+    else:
+        key = str(topics_val).lower()
+        if key in names:
+            collected.append(names[key])
+    return ",".join(collected)
 
 
 def ingest_brand(args: argparse.Namespace) -> int:
@@ -2570,149 +2695,6 @@ def ingest_brand(args: argparse.Namespace) -> int:
     conn.close()
     return 0
 
-
-def embed_entities(args: argparse.Namespace) -> int:
-    db_path = Path(args.adl_db)
-    if not db_path.exists():
-        print(f"❌ DB not found: {db_path}", file=sys.stderr)
-        return 1
-    conn = sqlite3.connect(db_path, timeout=10)
-    conn.row_factory = sqlite3.Row
-    configure_sqlite(conn)
-    ensure_creator_vectors_table(conn)
-    ensure_brand_vectors_table(conn)
-    ensure_creator_enrichment_table(conn)
-    ensure_brands_table(conn)
-
-    target = args.target
-    limit = args.limit
-    offset = args.offset
-    only_id = args.only_id
-    force = getattr(args, "force", False)
-    refreshall = getattr(args, "refreshall", False)
-
-    if target == "creators":
-        cursor = conn.cursor()
-        if refreshall:
-            confirm = input("Type YES to delete all creator vectors: ").strip()
-            if confirm != "YES":
-                print("Aborted.")
-                conn.close()
-                return 1
-            conn.execute("DELETE FROM creator_vectors")
-            conn.commit()
-            print("🗑️ Deleted all creator vectors.")
-        if only_id:
-            cursor.execute(
-                """
-                SELECT ce.podcastindex_id, ce.cleaned_text_block
-                FROM creator_enrichment ce
-                WHERE ce.podcastindex_id = ?
-                """,
-                (only_id,),
-            )
-        else:
-            cursor.execute(
-                """
-                SELECT ce.podcastindex_id, ce.cleaned_text_block,
-                       ce.source_spotify, ce.source_apple, ce.source_youtube
-                FROM creator_enrichment ce
-                LEFT JOIN creator_vectors cv ON cv.podcastindex_id = ce.podcastindex_id
-                WHERE cv.embedding IS NULL
-                LIMIT ? OFFSET ?
-                """,
-                (limit, offset),
-            )
-        rows = cursor.fetchall()
-        if not rows:
-            print("No creators to embed.")
-            conn.close()
-            return 0
-        embedded = 0
-        for r in rows:
-            if not force:
-                if not r["source_spotify"] or not r["source_apple"] or not r["source_youtube"]:
-                    continue
-            vec = embed_text_block(r["cleaned_text_block"] or "")
-            if not vec:
-                continue
-            conn.execute(
-                """
-                INSERT OR REPLACE INTO creator_vectors (podcastindex_id, embedding, created_at)
-                VALUES (?, ?, CURRENT_TIMESTAMP)
-                """,
-                (r["podcastindex_id"], json.dumps(vec)),
-            )
-            embedded += 1
-            if embedded % 10 == 0:
-                conn.commit()
-                print(f"Embedded {embedded}/{len(rows)} creators (last id={r['podcastindex_id']})")
-        conn.commit()
-        print(f"✅ Embedded {embedded} creators.")
-        conn.close()
-        return 0
-
-    if target == "brands":
-        cursor = conn.cursor()
-        if refreshall:
-            confirm = input("Type YES to delete all brand vectors: ").strip()
-            if confirm != "YES":
-                print("Aborted.")
-                conn.close()
-                return 1
-            conn.execute("DELETE FROM brand_vectors")
-            conn.commit()
-            print("🗑️ Deleted all brand vectors.")
-        if only_id:
-            cursor.execute(
-                "SELECT * FROM brands WHERE adlid = ?",
-                (only_id,),
-            )
-        else:
-            cursor.execute(
-                """
-                SELECT b.*
-                FROM brands b
-                LEFT JOIN brand_vectors bv ON bv.adlid = b.adlid
-                WHERE bv.embedding IS NULL
-                LIMIT ? OFFSET ?
-                """,
-                (limit, offset),
-            )
-        rows = cursor.fetchall()
-        if not rows:
-            print("No brands to embed.")
-            conn.close()
-            return 0
-        embedded = 0
-        for r in rows:
-            text_block = build_brand_text_block(r)
-            if not force:
-                # Require structured fields to avoid embedding noise
-                if not (r["brand_summary"] or r["extracted_description"]) or not (r["brand_vertical"] or r["extracted_product_category"]):
-                    continue
-            vec = embed_text_block(text_block)
-            if not vec:
-                continue
-            conn.execute(
-                """
-                INSERT OR REPLACE INTO brand_vectors (adlid, embedding, created_at)
-                VALUES (?, ?, CURRENT_TIMESTAMP)
-                """,
-                (r["adlid"], json.dumps(vec)),
-            )
-            embedded += 1
-            if embedded % 10 == 0:
-                conn.commit()
-                print(f"Embedded {embedded}/{len(rows)} brands (last id={r['adlid']})")
-        conn.commit()
-        print(f"✅ Embedded {embedded} brands.")
-        conn.close()
-        return 0
-
-    conn.close()
-    print(f"Unknown embed target: {target}")
-    return 1
 
 
 def test_compare(args: argparse.Namespace) -> int:
@@ -2873,6 +2855,8 @@ def normalize_entities(args: argparse.Namespace) -> int:
     ensure_creator_enrichment_table(conn)
     ensure_brands_table(conn)
     ensure_entity_normalized_table(conn)
+    ensure_normalization_lexicon_table(conn)
+    ensure_apple_categories_table(conn)
 
     entity_type = args.entity_type
     ids: List[int] = []
@@ -2943,27 +2927,21 @@ def normalize_entities(args: argparse.Namespace) -> int:
             for k, v in (raw_sources or {}).items():
                 if v:
                     fields_parts.append(f"{k.upper()}: {v}")
-        fields_text = "\n".join(fields_parts)
+        raw_blob = "\n".join(fields_parts)
+        simplified = simplify_entity_text(entity_type, name, raw_blob) or raw_blob
+        fields_text = f"SIMPLIFIED:\n{simplified}\n\nRAW:\n{raw_blob}"
         norm = normalize_entity_to_json(entity_type, name, fields_text, categories_hint)
         if not norm or not norm.get("summary"):
             print(f"⚠️ Normalization failed for {entity_type} {eid}")
             continue
+        # Map labels through lexicon where possible
+        norm["vertical"] = map_label_from_lexicon(conn, norm.get("vertical"))
+        norm["audience"] = map_label_from_lexicon(conn, norm.get("audience"))
+        norm["themes"] = map_label_from_lexicon(conn, norm.get("themes"))
+        norm["use_cases"] = map_label_from_lexicon(conn, norm.get("use_cases"))
+        norm["pain_points"] = map_label_from_lexicon(conn, norm.get("pain_points"))
         topics_val = norm.get("topics")
-        if isinstance(topics_val, list):
-            topics_str = ",".join(
-                [
-                    t
-                    if isinstance(t, str)
-                    else t.get("apple_subcategory_id")
-                    or t.get("apple_category_id")
-                    or t.get("apple_subcategory_name")
-                    or t.get("apple_category_name")
-                    or ""
-                    for t in topics_val
-                ]
-            )
-        else:
-            topics_str = topics_val or ""
+        topics_str = map_topics_to_apple(conn, topics_val)
         # Build a canonical normalized block for reference/embedding
         block_parts = [
             f"SUMMARY:\n{norm.get('summary','')}",
@@ -3068,6 +3046,27 @@ def build_embedding_text(entity: sqlite3.Row, entity_type: str, vector_type: str
     return None
 
 
+def compute_embedding_confidence(entity: sqlite3.Row) -> float:
+    score = 1.0
+    def missing(val: Optional[str]) -> bool:
+        return not val or not str(val).strip()
+    if missing(entity["normalized_vertical"]):
+        score -= 0.25
+    if missing(entity["normalized_audience"]):
+        score -= 0.2
+    if missing(entity["normalized_summary"]):
+        score -= 0.15
+    if missing(entity["normalized_topics"]):
+        score -= 0.1
+    if missing(entity["normalized_pain_points"]):
+        score -= 0.05
+    if score < 0:
+        score = 0.0
+    if score > 1:
+        score = 1.0
+    return score
+
+
 def embed_entity(args: argparse.Namespace) -> int:
     db_path = Path(args.adl_db)
     if not db_path.exists():
@@ -3140,6 +3139,7 @@ def embed_entity(args: argparse.Namespace) -> int:
             "DELETE FROM entity_embeddings WHERE entity_type=? AND entity_id=?",
             (entity_type, ent_id),
         )
+        confidence = compute_embedding_confidence(r)
         for vt in vector_types:
             text = build_embedding_text(r, entity_type, vt)
             if not text or not text.strip():
@@ -3152,7 +3152,7 @@ def embed_entity(args: argparse.Namespace) -> int:
                 INSERT INTO entity_embeddings (entity_type, entity_id, vector_type, embedding_vector, confidence, source_text, source_normalized_id, model_name)
                 VALUES (?, ?, ?, ?, ?, ?, ?, ?)
                 """,
-                (entity_type, ent_id, vt, json.dumps(vec), 1.0, text[:4000], r["norm_id"], model_name),
+                (entity_type, ent_id, vt, json.dumps(vec), confidence, text[:4000], r["norm_id"], model_name),
             )
             inserted += 1
     conn.commit()
@@ -3299,103 +3299,6 @@ def relevance_label(score: float) -> str:
     if score >= 0.7:
         return "medium"
     return "weak"
-
-
-def rank_entities(args: argparse.Namespace) -> int:
-    db_path = Path(args.adl_db)
-    if not db_path.exists():
-        print(f"❌ DB not found: {db_path}", file=sys.stderr)
-        return 1
-    conn = sqlite3.connect(db_path, timeout=10)
-    conn.row_factory = sqlite3.Row
-    configure_sqlite(conn)
-    ensure_creator_vectors_table(conn)
-    ensure_brand_vectors_table(conn)
-
-    limit = args.limit
-    adlid = args.adlid
-
-    if args.bybrand:
-        brand = conn.execute("SELECT adlid, brand_name FROM brands WHERE adlid = ?", (adlid,)).fetchone()
-        if not brand:
-            print(f"❌ Brand adlid {adlid} not found.", file=sys.stderr)
-            return 1
-        bvec_row = conn.execute("SELECT embedding FROM brand_vectors WHERE adlid = ?", (adlid,)).fetchone()
-        if not bvec_row:
-            print(f"❌ No embedding for brand adlid {adlid}. Run embed brands first.", file=sys.stderr)
-            return 1
-        bvec = json.loads(bvec_row["embedding"])
-        creator_rows = conn.execute(
-            """
-            SELECT ce.podcastindex_id, ce.cleaned_text_block, pf.title AS name, cv.embedding
-            FROM creator_vectors cv
-            LEFT JOIN creator_enrichment ce ON ce.podcastindex_id = cv.podcastindex_id
-            LEFT JOIN podcastindex_feeds pf ON pf.id = ce.podcastindex_id
-            WHERE cv.embedding IS NOT NULL
-            """
-        ).fetchall()
-        scored = []
-        for r in creator_rows:
-            try:
-                cvec = json.loads(r["embedding"])
-            except Exception:
-                continue
-            score = cosine_similarity(bvec, cvec)
-            scored.append((f"{r['podcastindex_id']}|{r['name'] or ''}", score, relevance_label(score), ""))
-        scored.sort(key=lambda x: x[1], reverse=True)
-        rows = scored[:limit]
-        header = (f"Ranking by Brand: adlid={adlid}, brand=\"{brand['brand_name'] or ''}\"", "", "", "")
-        table = format_table(rows, ("podcast_title", "score", "relevance", "notes"))
-        print(header[0])
-        print(table)
-        return 0
-
-    if args.bycreator:
-        creator = conn.execute(
-            """
-            SELECT ce.podcastindex_id, pf.title AS name
-            FROM creators c
-            LEFT JOIN creator_enrichment ce ON ce.podcastindex_id = c.podcastindex_id
-            LEFT JOIN podcastindex_feeds pf ON pf.id = ce.podcastindex_id
-            WHERE c.podcastindex_id = ?
-            """,
-            (adlid,),
-        ).fetchone()
-        if not creator:
-            print(f"❌ Creator adlid {adlid} not found.", file=sys.stderr)
-            return 1
-        cvec_row = conn.execute(
-            "SELECT embedding FROM creator_vectors WHERE podcastindex_id = ?", (adlid,)
-        ).fetchone()
-        if not cvec_row:
-            print(f"❌ No embedding for creator adlid {adlid}. Run embed creators first.", file=sys.stderr)
-            return 1
-        cvec = json.loads(cvec_row["embedding"])
-        brand_rows = conn.execute(
-            """
-            SELECT b.adlid, b.brand_name, bv.embedding
-            FROM brand_vectors bv
-            LEFT JOIN brands b ON b.adlid = bv.adlid
-            WHERE bv.embedding IS NOT NULL
-            """
-        ).fetchall()
-        scored = []
-        for r in brand_rows:
-            try:
-                bvec = json.loads(r["embedding"])
-            except Exception:
-                continue
-            score = cosine_similarity(cvec, bvec)
-            scored.append((f"{r['adlid']}|{r['brand_name'] or ''}", score, relevance_label(score), ""))
-        scored.sort(key=lambda x: x[1], reverse=True)
-        rows = scored[:limit]
-        print(f"Ranking by Creator: adlid={adlid}, podcast=\"{creator['name'] or ''}\"")
-        table = format_table(rows, ("brand_name", "score", "relevance", "notes"))
-        print(table)
-        return 0
-
-    print("❌ Must specify --bybrand or --bycreator", file=sys.stderr)
-    return 1
 
 
 # Override with multi-dimensional ranking using entity_embeddings
@@ -3706,46 +3609,6 @@ def parse_args(argv: Optional[Sequence[str]] = None) -> argparse.Namespace:
         help="Write test brand embedding text to tests/test-enrich-brand-adlid-<id>_cleaned.txt",
     )
 
-    embed_parser = subparsers.add_parser("embed", help="Generate embeddings")
-    embed_parser.add_argument(
-        "target",
-        choices=["creators", "brands"],
-        help="What to embed",
-    )
-    embed_parser.add_argument(
-        "--adl-db",
-        type=Path,
-        default=Path("adelined_matching.db"),
-        help="Path to Adelined SQLite database (default: adelined_matching.db)",
-    )
-    embed_parser.add_argument(
-        "--limit",
-        type=int,
-        default=100,
-        help="Max rows to embed (default: 100)",
-    )
-    embed_parser.add_argument(
-        "--offset",
-        type=int,
-        default=0,
-        help="Offset rows (default: 0)",
-    )
-    embed_parser.add_argument(
-        "--only-id",
-        type=int,
-        help="Embed only this podcastindex_id (for creators) or adlid (for brands)",
-    )
-    embed_parser.add_argument(
-        "--force",
-        action="store_true",
-        help="Embed even if required sources are missing",
-    )
-    embed_parser.add_argument(
-        "--refreshall",
-        action="store_true",
-        help="Delete existing vectors for the chosen target before embedding (requires typing YES)",
-    )
-
     norm_entity_parser = subparsers.add_parser("normalize-entity", help="Normalize a brand or creator into structured fields")
     norm_entity_parser.add_argument(
         "--entity-type",
@@ -3954,8 +3817,6 @@ def main(argv: Optional[Sequence[str]] = None) -> int:
             return discover_apple(args)
     if args.action == "brand":
         return ingest_brand(args)
-    if args.action == "embed":
-        return embed_entities(args)
     if args.action == "normalize-entity":
         return normalize_entities(args)
     if args.action == "embed-entity":
@@ -3989,7 +3850,6 @@ Commands:
   python3 adl brand --url <website>
   python3 adl normalize-entity --entity-type brand|creator [--id <id> | --all-brands/--all-creators]
   python3 adl embed-entity --entity-type brand|creator [--id <id> | --limit N --offset M]
-  python3 adl embed [creators|brands] [options]
   python3 adl rank --bybrand/--bycreator --adlid <id> [options]
   python3 adl test-compare --text1/--file1 --text2/--file2
   python3 adl test-enrich --pid <podcastindex_id>
