@@ -8,6 +8,7 @@ Usage example:
 
 import argparse
 import json
+import csv
 import os
 import re
 import sqlite3
@@ -2862,6 +2863,20 @@ def normalize_entities(args: argparse.Namespace) -> int:
     ids: List[int] = []
     if getattr(args, "id", None):
         ids = [args.id]
+    elif getattr(args, "id_range", None):
+        start_id, end_id = args.id_range
+        if entity_type == "brand":
+            rows = conn.execute(
+                "SELECT adlid FROM brands WHERE adlid BETWEEN ? AND ? ORDER BY adlid",
+                (start_id, end_id),
+            ).fetchall()
+            ids = [r[0] for r in rows]
+        else:
+            rows = conn.execute(
+                "SELECT podcastindex_id FROM creators WHERE podcastindex_id BETWEEN ? AND ? ORDER BY podcastindex_id",
+                (start_id, end_id),
+            ).fetchall()
+            ids = [r[0] for r in rows]
     else:
         if entity_type == "brand" and getattr(args, "all_brands", False):
             rows = conn.execute(
@@ -3343,8 +3358,9 @@ def rank_entities(args: argparse.Namespace) -> int:
             return 1
         creator_rows = conn.execute(
             """
-            SELECT c.podcastindex_id, c.title AS name
+            SELECT c.podcastindex_id, COALESCE(c.title, pf.title, '') AS name
             FROM creators c
+            LEFT JOIN podcastindex_feeds pf ON pf.id = c.podcastindex_id
             WHERE EXISTS (SELECT 1 FROM entity_embeddings ee WHERE ee.entity_type='creator' AND ee.entity_id=c.podcastindex_id)
             """
         ).fetchall()
@@ -3356,12 +3372,20 @@ def rank_entities(args: argparse.Namespace) -> int:
             final_score, sims = score_pair(bmap, cmap)
             top_dims = sorted(sims.items(), key=lambda x: x[1], reverse=True)[:2]
             notes = "; ".join([f"{d}:{v:.2f}" for d, v in top_dims])
-            scored.append((f"{r['podcastindex_id']}|{r['name'] or ''}", final_score, relevance_label(final_score), notes))
-        scored.sort(key=lambda x: x[1], reverse=True)
+            scored.append((r["podcastindex_id"], r["name"] or "", final_score, relevance_label(final_score), notes))
+        scored.sort(key=lambda x: x[2], reverse=True)
         rows = scored[:limit]
         print(f"Ranking by Brand: adlid={adlid}, brand=\"{brand['brand_name'] or ''}\"")
-        table = format_table(rows, ("podcast_title", "score", "relevance", "top_dims"))
+        table = format_table(rows, ("id", "podcast_title", "score", "relevance", "top_dims"))
         print(table)
+        if getattr(args, "csv", False):
+            out_name = f"{datetime.utcnow():%Y%m%d}-brand{adlid}.csv"
+            with open(out_name, "w", newline="") as f:
+                writer = csv.writer(f)
+                writer.writerow(["id", "podcast_title", "score", "relevance", "top_dims"])
+                for r in rows:
+                    writer.writerow(r)
+            print(f"💾 Wrote {out_name}")
         conn.close()
         return 0
 
@@ -3379,7 +3403,7 @@ def rank_entities(args: argparse.Namespace) -> int:
             return 1
         brand_rows = conn.execute(
             """
-            SELECT b.adlid, b.brand_name
+            SELECT b.adlid, COALESCE(b.brand_name, '') AS brand_name
             FROM brands b
             WHERE EXISTS (SELECT 1 FROM entity_embeddings ee WHERE ee.entity_type='brand' AND ee.entity_id=b.adlid)
             """
@@ -3392,12 +3416,20 @@ def rank_entities(args: argparse.Namespace) -> int:
             final_score, sims = score_pair(bmap, cmap)
             top_dims = sorted(sims.items(), key=lambda x: x[1], reverse=True)[:2]
             notes = "; ".join([f"{d}:{v:.2f}" for d, v in top_dims])
-            scored.append((f"{r['adlid']}|{r['brand_name'] or ''}", final_score, relevance_label(final_score), notes))
-        scored.sort(key=lambda x: x[1], reverse=True)
+            scored.append((r["adlid"], r["brand_name"] or "", final_score, relevance_label(final_score), notes))
+        scored.sort(key=lambda x: x[2], reverse=True)
         rows = scored[:limit]
         print(f"Ranking by Creator: adlid={adlid}, podcast=\"{creator['name'] or ''}\"")
-        table = format_table(rows, ("brand_name", "score", "relevance", "notes"))
+        table = format_table(rows, ("id", "brand_name", "score", "relevance", "notes"))
         print(table)
+        if getattr(args, "csv", False):
+            out_name = f"{datetime.utcnow():%Y%m%d}-creator{adlid}.csv"
+            with open(out_name, "w", newline="") as f:
+                writer = csv.writer(f)
+                writer.writerow(["id", "brand_name", "score", "relevance", "notes"])
+                for r in rows:
+                    writer.writerow(r)
+            print(f"💾 Wrote {out_name}")
         conn.close()
         return 0
 
@@ -3619,6 +3651,13 @@ def parse_args(argv: Optional[Sequence[str]] = None) -> argparse.Namespace:
     norm_entity_parser.add_argument("--id", type=int, help="Specific id (adlid for brand, podcastindex_id for creator)")
     norm_entity_parser.add_argument("--all-brands", action="store_true", help="Normalize all brands (paged with limit/offset)")
     norm_entity_parser.add_argument("--all-creators", action="store_true", help="Normalize all creators (paged with limit/offset)")
+    norm_entity_parser.add_argument(
+        "--id-range",
+        nargs=2,
+        type=int,
+        metavar=("START_ID", "END_ID"),
+        help="Normalize a contiguous id range (inclusive). Uses adlid for brands, podcastindex_id for creators.",
+    )
     norm_entity_parser.add_argument("--limit", type=int, default=100, help="Max rows to process (default 100)")
     norm_entity_parser.add_argument("--offset", type=int, default=0, help="Offset for bulk mode")
     norm_entity_parser.add_argument(
@@ -3701,6 +3740,11 @@ def parse_args(argv: Optional[Sequence[str]] = None) -> argparse.Namespace:
         type=int,
         default=20,
         help="Number of top results to show (default: 20)",
+    )
+    rank_parser.add_argument(
+        "--csv",
+        action="store_true",
+        help="If set, also write results to CSV (yyyyMMdd-brand{n}.csv or creator{n}.csv)",
     )
 
     test_compare = subparsers.add_parser("test-compare", help="Compare two text inputs via embeddings")
