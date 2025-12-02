@@ -1,0 +1,614 @@
+[
+  {
+    "id": "arts",
+    "label": "Arts",
+    "parent": null,
+    "path": "Arts"
+  },
+  {
+    "id": "arts-books",
+    "label": "Books",
+    "parent": "arts",
+    "path": "Arts / Books"
+  },
+  {
+    "id": "arts-design",
+    "label": "Design",
+    "parent": "arts",
+    "path": "Arts / Design"
+  },
+  {
+    "id": "arts-fashion-beauty",
+    "label": "Fashion & Beauty",
+    "parent": "arts",
+    "path": "Arts / Fashion & Beauty"
+  },
+  {
+    "id": "arts-food",
+    "label": "Food",
+    "parent": "arts",
+    "path": "Arts / Food"
+  },
+  {
+    "id": "arts-performing-arts",
+    "label": "Performing Arts",
+    "parent": "arts",
+    "path": "Arts / Performing Arts"
+  },
+  {
+    "id": "arts-visual-arts",
+    "label": "Visual Arts",
+    "parent": "arts",
+    "path": "Arts / Visual Arts"
+  },
+  {
+    "id": "business",
+    "label": "Business",
+    "parent": null,
+    "path": "Business"
+  },
+  {
+    "id": "business-careers",
+    "label": "Careers",
+    "parent": "business",
+    "path": "Business / Careers"
+  },
+  {
+    "id": "business-entrepreneurship",
+    "label": "Entrepreneurship",
+    "parent": "business",
+    "path": "Business / Entrepreneurship"
+  },
+  {
+    "id": "business-investing",
+    "label": "Investing",
+    "parent": "business",
+    "path": "Business / Investing"
+  },
+  {
+    "id": "business-management",
+    "label": "Management",
+    "parent": "business",
+    "path": "Business / Management"
+  },
+  {
+    "id": "business-marketing",
+    "label": "Marketing",
+    "parent": "business",
+    "path": "Business / Marketing"
+  },
+  {
+    "id": "business-non-profit",
+    "label": "Non-Profit",
+    "parent": "business",
+    "path": "Business / Non-Profit"
+  },
+  {
+    "id": "comedy",
+    "label": "Comedy",
+    "parent": null,
+    "path": "Comedy"
+  },
+  {
+    "id": "comedy-interviews",
+    "label": "Comedy Interviews",
+    "parent": "comedy",
+    "path": "Comedy / Comedy Interviews"
+  },
+  {
+    "id": "comedy-improv",
+    "label": "Improv",
+    "parent": "comedy",
+    "path": "Comedy / Improv"
+  },
+  {
+    "id": "comedy-stand-up",
+    "label": "Stand-Up",
+    "parent": "comedy",
+    "path": "Comedy / Stand-Up"
+  },
+  {
+    "id": "education",
+    "label": "Education",
+    "parent": null,
+    "path": "Education"
+  },
+  {
+    "id": "education-courses",
+    "label": "Courses",
+    "parent": "education",
+    "path": "Education / Courses"
+  },
+  {
+    "id": "education-how-to",
+    "label": "How To",
+    "parent": "education",
+    "path": "Education / How To"
+  },
+  {
+    "id": "education-language-learning",
+    "label": "Language Learning",
+    "parent": "education",
+    "path": "Education / Language Learning"
+  },
+  {
+    "id": "education-self-improvement",
+    "label": "Self-Improvement",
+    "parent": "education",
+    "path": "Education / Self-Improvement"
+  },
+  {
+    "id": "fiction",
+    "label": "Fiction",
+    "parent": null,
+    "path": "Fiction"
+  },
+  {
+    "id": "fiction-comedy",
+    "label": "Comedy Fiction",
+    "parent": "fiction",
+    "path": "Fiction / Comedy Fiction"
+  },
+  {
+    "id": "fiction-drama",
+    "label": "Drama",
+    "parent": "fiction",
+    "path": "Fiction / Drama"
+  },
+  {
+    "id": "fiction-sci-fi",
+    "label": "Science Fiction",
+    "parent": "fiction",
+    "path": "Fiction / Science Fiction"
+  },
+  {
+    "id": "government",
+    "label": "Government",
+    "parent": null,
+    "path": "Government"
+  },
+  {
+    "id": "history",
+    "label": "History",
+    "parent": null,
+    "path": "History"
+  },
+  {
+    "id": "health-fitness",
+    "label": "Health & Fitness",
+    "parent": null,
+    "path": "Health & Fitness"
+  },
+  {
+    "id": "health-alternative",
+    "label": "Alternative Health",
+    "parent": "health-fitness",
+    "path": "Health & Fitness / Alternative Health"
+  },
+  {
+    "id": "health-fitness-fitness",
+    "label": "Fitness",
+    "parent": "health-fitness",
+    "path": "Health & Fitness / Fitness"
+  },
+  {
+    "id": "health-medicine",
+    "label": "Medicine",
+    "parent": "health-fitness",
+    "path": "Health & Fitness / Medicine"
+  },
+  {
+    "id": "health-mental",
+    "label": "Mental Health",
+    "parent": "health-fitness",
+    "path": "Health & Fitness / Mental Health"
+  },
+  {
+    "id": "health-nutrition",
+    "label": "Nutrition",
+    "parent": "health-fitness",
+    "path": "Health & Fitness / Nutrition"
+  },
+  {
+    "id": "health-sexuality",
+    "label": "Sexuality",
+    "parent": "health-fitness",
+    "path": "Health & Fitness / Sexuality"
+  },
+  {
+    "id": "kids-family",
+    "label": "Kids & Family",
+    "parent": null,
+    "path": "Kids & Family"
+  },
+  {
+    "id": "kids-education",
+    "label": "Education for Kids",
+    "parent": "kids-family",
+    "path": "Kids & Family / Education for Kids"
+  },
+  {
+    "id": "kids-parenting",
+    "label": "Parenting",
+    "parent": "kids-family",
+    "path": "Kids & Family / Parenting"
+  },
+  {
+    "id": "kids-pets-animals",
+    "label": "Pets & Animals",
+    "parent": "kids-family",
+    "path": "Kids & Family / Pets & Animals"
+  },
+  {
+    "id": "kids-stories",
+    "label": "Stories for Kids",
+    "parent": "kids-family",
+    "path": "Kids & Family / Stories for Kids"
+  },
+  {
+    "id": "leisure",
+    "label": "Leisure",
+    "parent": null,
+    "path": "Leisure"
+  },
+  {
+    "id": "leisure-animation-manga",
+    "label": "Animation & Manga",
+    "parent": "leisure",
+    "path": "Leisure / Animation & Manga"
+  },
+  {
+    "id": "leisure-automotive",
+    "label": "Automotive",
+    "parent": "leisure",
+    "path": "Leisure / Automotive"
+  },
+  {
+    "id": "leisure-aviation",
+    "label": "Aviation",
+    "parent": "leisure",
+    "path": "Leisure / Aviation"
+  },
+  {
+    "id": "leisure-crafts",
+    "label": "Crafts",
+    "parent": "leisure",
+    "path": "Leisure / Crafts"
+  },
+  {
+    "id": "leisure-games",
+    "label": "Games",
+    "parent": "leisure",
+    "path": "Leisure / Games"
+  },
+  {
+    "id": "leisure-hobbies",
+    "label": "Hobbies",
+    "parent": "leisure",
+    "path": "Leisure / Hobbies"
+  },
+  {
+    "id": "leisure-home-garden",
+    "label": "Home & Garden",
+    "parent": "leisure",
+    "path": "Leisure / Home & Garden"
+  },
+  {
+    "id": "leisure-video-games",
+    "label": "Video Games",
+    "parent": "leisure",
+    "path": "Leisure / Video Games"
+  },
+  {
+    "id": "music",
+    "label": "Music",
+    "parent": null,
+    "path": "Music"
+  },
+  {
+    "id": "news",
+    "label": "News",
+    "parent": null,
+    "path": "News"
+  },
+  {
+    "id": "news-business",
+    "label": "Business News",
+    "parent": "news",
+    "path": "News / Business News"
+  },
+  {
+    "id": "news-daily",
+    "label": "Daily News",
+    "parent": "news",
+    "path": "News / Daily News"
+  },
+  {
+    "id": "news-entertainment",
+    "label": "Entertainment News",
+    "parent": "news",
+    "path": "News / Entertainment News"
+  },
+  {
+    "id": "news-commentary",
+    "label": "News Commentary",
+    "parent": "news",
+    "path": "News / News Commentary"
+  },
+  {
+    "id": "news-politics",
+    "label": "Politics",
+    "parent": "news",
+    "path": "News / Politics"
+  },
+  {
+    "id": "news-sports",
+    "label": "Sports News",
+    "parent": "news",
+    "path": "News / Sports News"
+  },
+  {
+    "id": "news-tech",
+    "label": "Tech News",
+    "parent": "news",
+    "path": "News / Tech News"
+  },
+  {
+    "id": "religion-spirituality",
+    "label": "Religion & Spirituality",
+    "parent": null,
+    "path": "Religion & Spirituality"
+  },
+  {
+    "id": "religion-buddhism",
+    "label": "Buddhism",
+    "parent": "religion-spirituality",
+    "path": "Religion & Spirituality / Buddhism"
+  },
+  {
+    "id": "religion-christianity",
+    "label": "Christianity",
+    "parent": "religion-spirituality",
+    "path": "Religion & Spirituality / Christianity"
+  },
+  {
+    "id": "religion-hinduism",
+    "label": "Hinduism",
+    "parent": "religion-spirituality",
+    "path": "Religion & Spirituality / Hinduism"
+  },
+  {
+    "id": "religion-islam",
+    "label": "Islam",
+    "parent": "religion-spirituality",
+    "path": "Religion & Spirituality / Islam"
+  },
+  {
+    "id": "religion-judaism",
+    "label": "Judaism",
+    "parent": "religion-spirituality",
+    "path": "Religion & Spirituality / Judaism"
+  },
+  {
+    "id": "religion-religion",
+    "label": "Religion",
+    "parent": "religion-spirituality",
+    "path": "Religion & Spirituality / Religion"
+  },
+  {
+    "id": "religion-spirituality-sub",
+    "label": "Spirituality",
+    "parent": "religion-spirituality",
+    "path": "Religion & Spirituality / Spirituality"
+  },
+  {
+    "id": "science",
+    "label": "Science",
+    "parent": null,
+    "path": "Science"
+  },
+  {
+    "id": "science-astronomy",
+    "label": "Astronomy",
+    "parent": "science",
+    "path": "Science / Astronomy"
+  },
+  {
+    "id": "science-chemistry",
+    "label": "Chemistry",
+    "parent": "science",
+    "path": "Science / Chemistry"
+  },
+  {
+    "id": "science-earth",
+    "label": "Earth Sciences",
+    "parent": "science",
+    "path": "Science / Earth Sciences"
+  },
+  {
+    "id": "science-life",
+    "label": "Life Sciences",
+    "parent": "science",
+    "path": "Science / Life Sciences"
+  },
+  {
+    "id": "science-mathematics",
+    "label": "Mathematics",
+    "parent": "science",
+    "path": "Science / Mathematics"
+  },
+  {
+    "id": "science-natural",
+    "label": "Natural Sciences",
+    "parent": "science",
+    "path": "Science / Natural Sciences"
+  },
+  {
+    "id": "science-nature",
+    "label": "Nature",
+    "parent": "science",
+    "path": "Science / Nature"
+  },
+  {
+    "id": "science-physics",
+    "label": "Physics",
+    "parent": "science",
+    "path": "Science / Physics"
+  },
+  {
+    "id": "science-social",
+    "label": "Social Sciences",
+    "parent": "science",
+    "path": "Science / Social Sciences"
+  },
+  {
+    "id": "society-culture",
+    "label": "Society & Culture",
+    "parent": null,
+    "path": "Society & Culture"
+  },
+  {
+    "id": "society-documentary",
+    "label": "Documentary",
+    "parent": "society-culture",
+    "path": "Society & Culture / Documentary"
+  },
+  {
+    "id": "society-personal-journals",
+    "label": "Personal Journals",
+    "parent": "society-culture",
+    "path": "Society & Culture / Personal Journals"
+  },
+  {
+    "id": "society-philosophy",
+    "label": "Philosophy",
+    "parent": "society-culture",
+    "path": "Society & Culture / Philosophy"
+  },
+  {
+    "id": "society-places-travel",
+    "label": "Places & Travel",
+    "parent": "society-culture",
+    "path": "Society & Culture / Places & Travel"
+  },
+  {
+    "id": "society-relationships",
+    "label": "Relationships",
+    "parent": "society-culture",
+    "path": "Society & Culture / Relationships"
+  },
+  {
+    "id": "sports",
+    "label": "Sports",
+    "parent": null,
+    "path": "Sports"
+  },
+  {
+    "id": "sports-baseball",
+    "label": "Baseball",
+    "parent": "sports",
+    "path": "Sports / Baseball"
+  },
+  {
+    "id": "sports-basketball",
+    "label": "Basketball",
+    "parent": "sports",
+    "path": "Sports / Basketball"
+  },
+  {
+    "id": "sports-cricket",
+    "label": "Cricket",
+    "parent": "sports",
+    "path": "Sports / Cricket"
+  },
+  {
+    "id": "sports-fantasy",
+    "label": "Fantasy Sports",
+    "parent": "sports",
+    "path": "Sports / Fantasy Sports"
+  },
+  {
+    "id": "sports-football",
+    "label": "Football",
+    "parent": "sports",
+    "path": "Sports / Football"
+  },
+  {
+    "id": "sports-golf",
+    "label": "Golf",
+    "parent": "sports",
+    "path": "Sports / Golf"
+  },
+  {
+    "id": "sports-hockey",
+    "label": "Hockey",
+    "parent": "sports",
+    "path": "Sports / Hockey"
+  },
+  {
+    "id": "sports-rugby",
+    "label": "Rugby",
+    "parent": "sports",
+    "path": "Sports / Rugby"
+  },
+  {
+    "id": "sports-running",
+    "label": "Running",
+    "parent": "sports",
+    "path": "Sports / Running"
+  },
+  {
+    "id": "sports-soccer",
+    "label": "Soccer",
+    "parent": "sports",
+    "path": "Sports / Soccer"
+  },
+  {
+    "id": "sports-swimming",
+    "label": "Swimming",
+    "parent": "sports",
+    "path": "Sports / Swimming"
+  },
+  {
+    "id": "sports-tennis",
+    "label": "Tennis",
+    "parent": "sports",
+    "path": "Sports / Tennis"
+  },
+  {
+    "id": "sports-volleyball",
+    "label": "Volleyball",
+    "parent": "sports",
+    "path": "Sports / Volleyball"
+  },
+  {
+    "id": "sports-wilderness",
+    "label": "Wilderness",
+    "parent": "sports",
+    "path": "Sports / Wilderness"
+  },
+  {
+    "id": "sports-wrestling",
+    "label": "Wrestling",
+    "parent": "sports",
+    "path": "Sports / Wrestling"
+  },
+  {
+    "id": "technology",
+    "label": "Technology",
+    "parent": null,
+    "path": "Technology"
+  },
+  {
+    "id": "true-crime",
+    "label": "True Crime",
+    "parent": null,
+    "path": "True Crime"
+  },
+  {
+    "id": "tv-film",
+    "label": "TV & Film",
+    "parent": null,
+    "path": "TV & Film"
+  }
+]

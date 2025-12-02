@@ -320,6 +320,15 @@ def ensure_creators_table(conn: sqlite3.Connection) -> None:
             podcastguid TEXT,
             itunesid INTEGER,
             language TEXT,
+            normalized_summary TEXT,
+            normalized_vertical TEXT,
+            normalized_audience TEXT,
+            normalized_pain_points TEXT,
+            normalized_use_cases TEXT,
+            normalized_themes TEXT,
+            normalized_tone TEXT,
+            normalized_geo TEXT,
+            normalized_topics TEXT,
             title TEXT,
             description TEXT,
             feed_url TEXT,
@@ -341,6 +350,18 @@ def ensure_creators_table(conn: sqlite3.Connection) -> None:
     )
     conn.execute("CREATE UNIQUE INDEX IF NOT EXISTS idx_creators_pid ON creators(podcastindex_id)")
     conn.execute("CREATE INDEX IF NOT EXISTS idx_creators_itunesid ON creators(itunesid)")
+    for col, coltype in [
+        ("normalized_summary", "TEXT"),
+        ("normalized_vertical", "TEXT"),
+        ("normalized_audience", "TEXT"),
+        ("normalized_pain_points", "TEXT"),
+        ("normalized_use_cases", "TEXT"),
+        ("normalized_themes", "TEXT"),
+        ("normalized_tone", "TEXT"),
+        ("normalized_geo", "TEXT"),
+        ("normalized_topics", "TEXT"),
+    ]:
+        ensure_column(conn, "creators", col, coltype)
 
 
 def ensure_creator_enrichment_table(conn: sqlite3.Connection) -> None:
@@ -400,6 +421,15 @@ def ensure_brands_table(conn: sqlite3.Connection) -> None:
             recommended_vertical TEXT,
             recommended_confidence REAL,
             candidate_verticals TEXT,
+            normalized_summary TEXT,
+            normalized_vertical TEXT,
+            normalized_audience TEXT,
+            normalized_pain_points TEXT,
+            normalized_use_cases TEXT,
+            normalized_themes TEXT,
+            normalized_tone TEXT,
+            normalized_geo TEXT,
+            normalized_topics TEXT,
             created_at DATETIME DEFAULT CURRENT_TIMESTAMP,
             updated_at DATETIME DEFAULT CURRENT_TIMESTAMP
         )
@@ -419,6 +449,15 @@ def ensure_brands_table(conn: sqlite3.Connection) -> None:
         ("recommended_vertical", "TEXT"),
         ("recommended_confidence", "REAL"),
         ("candidate_verticals", "TEXT"),
+        ("normalized_summary", "TEXT"),
+        ("normalized_vertical", "TEXT"),
+        ("normalized_audience", "TEXT"),
+        ("normalized_pain_points", "TEXT"),
+        ("normalized_use_cases", "TEXT"),
+        ("normalized_themes", "TEXT"),
+        ("normalized_tone", "TEXT"),
+        ("normalized_geo", "TEXT"),
+        ("normalized_topics", "TEXT"),
     ]:
         ensure_column(conn, "brands", col, coltype)
 
@@ -444,6 +483,70 @@ def ensure_brand_vectors_table(conn: sqlite3.Connection) -> None:
             created_at DATETIME DEFAULT CURRENT_TIMESTAMP
         )
         """
+    )
+
+
+def ensure_entity_embeddings_table(conn: sqlite3.Connection) -> None:
+    conn.execute(
+        """
+        CREATE TABLE IF NOT EXISTS entity_embeddings (
+            embedding_id INTEGER PRIMARY KEY AUTOINCREMENT,
+            entity_type TEXT CHECK(entity_type IN ('creator', 'brand')),
+            entity_id INTEGER,
+            vector_type TEXT,
+            embedding_vector TEXT,
+            confidence REAL,
+            source_text TEXT,
+            source_normalized_id INTEGER,
+            model_name TEXT,
+            created_at DATETIME DEFAULT CURRENT_TIMESTAMP
+        )
+        """
+    )
+    conn.execute(
+        "CREATE INDEX IF NOT EXISTS idx_entity_embeddings ON entity_embeddings(entity_type, entity_id)"
+    )
+    ensure_column(conn, "entity_embeddings", "source_normalized_id", "INTEGER")
+    ensure_column(conn, "entity_embeddings", "vector_type", "TEXT")
+    ensure_column(conn, "entity_embeddings", "model_name", "TEXT")
+
+
+def ensure_entity_normalized_table(conn: sqlite3.Connection) -> None:
+    conn.execute(
+        """
+        CREATE TABLE IF NOT EXISTS entity_normalized (
+            id INTEGER PRIMARY KEY AUTOINCREMENT,
+            entity_type TEXT NOT NULL,
+            entity_id INTEGER NOT NULL,
+            version TEXT DEFAULT 'v1',
+            normalized_block TEXT NOT NULL,
+            norm_fields TEXT,
+            created_at DATETIME DEFAULT CURRENT_TIMESTAMP
+        )
+        """
+    )
+    conn.execute(
+        """
+        CREATE UNIQUE INDEX IF NOT EXISTS idx_entity_norm_unique
+        ON entity_normalized(entity_type, entity_id, version)
+        """
+    )
+
+
+def ensure_apple_categories_table(conn: sqlite3.Connection) -> None:
+    conn.execute(
+        """
+        CREATE TABLE IF NOT EXISTS apple_podcast_categories (
+            id INTEGER PRIMARY KEY AUTOINCREMENT,
+            apple_id TEXT,
+            parent_apple_id TEXT,
+            name TEXT,
+            full_path TEXT
+        )
+        """
+    )
+    conn.execute(
+        "CREATE INDEX IF NOT EXISTS idx_apple_cat_parent ON apple_podcast_categories(parent_apple_id)"
     )
 
 
@@ -2125,6 +2228,62 @@ def extract_creator_metadata(raw_text: str) -> Dict:
         return {}
 
 
+# ---- Normalization helpers ----
+NORMAL_VECTOR_TYPES = [
+    "semantic_summary",
+    "topics",
+    "vertical",
+    "audience",
+    "pain_points",
+    "use_cases",
+    "themes",
+    "tone",
+    "geo",
+]
+
+
+def normalize_entity_to_json(entity_type: str, name: str, fields_text: str) -> Optional[Dict]:
+    key = os.getenv("OPENAI_API_KEY")
+    if not key:
+        return None
+    client = OpenAI(api_key=key)
+    schema = (
+        "{"
+        "\"summary\":\"...\","  # summary of what they are/do
+        "\"vertical\":\"...\","  # concise industry label
+        "\"audience\":\"...\","  # who this is for
+        "\"pain_points\":\"...\","  # problems solved/talked about
+        "\"use_cases\":\"...\","  # how used / scenarios
+        "\"themes\":\"...\","  # key themes/topics
+        "\"tone\":\"...\","  # tone descriptors
+        "\"geo\":\"...\","  # geography focus
+        "\"topics\":[{\"apple_category_name\":\"...\",\"apple_subcategory_name\":\"...\",\"apple_category_id\":\"...\",\"apple_subcategory_id\":\"...\"}]"
+        "}"
+    )
+    prompt = (
+        "You are a classification and summarisation assistant.\n"
+        "Normalize noisy marketing/technical text about an entity into a simple schema, using plain language a non-expert would understand.\n"
+        "Return JSON ONLY with keys: summary, vertical, audience, pain_points, use_cases, themes, tone, geo, topics (array as specified).\n"
+        "Be concise, high-signal, no fluff. Use common industry labels.\n\n"
+        f"ENTITY_TYPE: {entity_type}\n"
+        f"NAME: {name}\n"
+        f"RAW FIELDS:\n{fields_text}\n\n"
+        "Output JSON in this structure:\n"
+        + schema
+    )
+    try:
+        resp = client.chat.completions.create(
+            model="gpt-4o-mini",
+            messages=[{"role": "user", "content": prompt}],
+            temperature=0.1,
+            response_format={"type": "json_object"},
+        )
+        return json.loads(resp.choices[0].message.content)
+    except Exception as exc:
+        print(f"⚠️ Normalization failed: {exc}", file=sys.stderr)
+        return None
+
+
 def build_brand_text_block(row: sqlite3.Row) -> str:
     def clip(val: Optional[str], max_len: int = 800) -> str:
         if not val:
@@ -2164,6 +2323,13 @@ def embed_text_block(text: str) -> Optional[List[float]]:
         return resp.data[0].embedding
     except Exception as exc:
         print(f"⚠️ Embedding failed: {exc}", file=sys.stderr)
+        return None
+
+
+def parse_embedding(text: str) -> Optional[List[float]]:
+    try:
+        return json.loads(text) if text else None
+    except Exception:
         return None
 
 
@@ -2455,6 +2621,45 @@ def test_compare(args: argparse.Namespace) -> int:
             return path.read_text()
         return None
 
+    if hasattr(args, "brand_id") and getattr(args, "brand_id", None) and hasattr(args, "creator_id") and getattr(args, "creator_id", None):
+        db_path = Path(getattr(args, "adl_db", "adelined_matching.db"))
+        if not db_path.exists():
+            print(f"❌ DB not found: {db_path}", file=sys.stderr)
+            return 1
+        conn = sqlite3.connect(db_path, timeout=10)
+        conn.row_factory = sqlite3.Row
+        configure_sqlite(conn)
+        bmap = load_embeddings_map(conn, "brand", args.brand_id)
+        cmap = load_embeddings_map(conn, "creator", args.creator_id)
+        if not bmap or not cmap:
+            print("❌ Missing embeddings for provided ids.", file=sys.stderr)
+            return 1
+        weights = {
+            "semantic_summary": 0.25,
+            "audience": 0.25,
+            "pain_points": 0.15,
+            "vertical": 0.15,
+            "topics": 0.10,
+            "tone": 0.05,
+            "geo": 0.05,
+        }
+        sims = {}
+        for vt, w in weights.items():
+            if vt in bmap and vt in cmap:
+                sims[vt] = cosine_similarity(bmap[vt], cmap[vt])
+        num = sum(sims.get(vt, 0) * w for vt, w in weights.items() if vt in sims)
+        denom = sum(w for vt, w in weights.items() if vt in sims)
+        final_score = num / denom if denom else 0.0
+        print("TEST COMPARISON RESULT")
+        print("======================")
+        print(f"Final score: {final_score:.3f}")
+        print(f"Interpretation: {relevance_label(final_score)}")
+        print("\nPer-dimension:")
+        for vt, val in sims.items():
+            print(f"  {vt:16s}: {val:.3f}")
+        conn.close()
+        return 0
+
     t1 = load_text(args.text1, args.file1)
     t2 = load_text(args.text2, args.file2)
     if not t1 or not t2:
@@ -2489,16 +2694,25 @@ def export_entity(args: argparse.Namespace) -> int:
     conn.row_factory = sqlite3.Row
     configure_sqlite(conn)
     try:
+        use_norm = getattr(args, "usenorm", False)
         if target == "creator":
             row = conn.execute(
-                "SELECT cleaned_text_block FROM creator_enrichment WHERE podcastindex_id = ?",
+                "SELECT cleaned_text_block, normalized_text FROM creator_enrichment WHERE podcastindex_id = ?",
                 (entity_id,),
             ).fetchone()
-            if not row or not row["cleaned_text_block"]:
-                print(f"❌ No cleaned_text_block found for creator pid={entity_id}", file=sys.stderr)
+            if not row:
+                print(f"❌ No enrichment found for creator pid={entity_id}", file=sys.stderr)
                 return 1
-            out_path.write_text(row["cleaned_text_block"])
-            print(f"📝 Exported creator pid={entity_id} cleaned block to {out_path}")
+            text = None
+            if use_norm and row["normalized_text"]:
+                text = row["normalized_text"]
+            elif row["cleaned_text_block"]:
+                text = row["cleaned_text_block"]
+            if not text:
+                print(f"❌ No text found for creator pid={entity_id}", file=sys.stderr)
+                return 1
+            out_path.write_text(text)
+            print(f"📝 Exported creator pid={entity_id} {'normalized' if use_norm and row['normalized_text'] else 'cleaned'} block to {out_path}")
             return 0
         if target == "brand":
             row = conn.execute(
@@ -2508,15 +2722,325 @@ def export_entity(args: argparse.Namespace) -> int:
             if not row:
                 print(f"❌ No brand found for adlid={entity_id}", file=sys.stderr)
                 return 1
-            text_block = build_brand_text_block(row)
+            text_block = None
+            if use_norm and row["normalized_summary"]:
+                parts = [
+                    f"NAME: {row['brand_name'] or ''}",
+                    f"SUMMARY:\n{row['normalized_summary'] or ''}",
+                    f"VERTICAL:\n{row['normalized_vertical'] or ''}",
+                    f"AUDIENCE:\n{row['normalized_audience'] or ''}",
+                    f"USE_CASES:\n{row['normalized_use_cases'] or ''}",
+                    f"PAIN_POINTS:\n{row['normalized_pain_points'] or ''}",
+                    f"THEMES:\n{row['normalized_themes'] or ''}",
+                    f"TONE:\n{row['normalized_tone'] or ''}",
+                    f"GEO:\n{row['normalized_geo'] or ''}",
+                    f"TOPICS:\n{row['normalized_topics'] or ''}",
+                ]
+                text_block = "\n".join(parts)
+            else:
+                text_block = build_brand_text_block(row)
             out_path.write_text(text_block)
-            print(f"📝 Exported brand adlid={entity_id} cleaned block to {out_path}")
+            print(f"📝 Exported brand adlid={entity_id} {'normalized' if use_norm and row['normalized_summary'] else 'cleaned'} block to {out_path}")
             return 0
         print(f"❌ Unknown target: {target}", file=sys.stderr)
         return 1
     finally:
         conn.close()
 
+
+def get_normalized_entity(conn: sqlite3.Connection, entity_type: str, entity_id: int) -> Optional[sqlite3.Row]:
+    return conn.execute(
+        """
+        SELECT *
+        FROM entity_normalized
+        WHERE entity_type=? AND entity_id=? AND version='v1'
+        """,
+        (entity_type, entity_id),
+    ).fetchone()
+
+
+def normalize_entities(args: argparse.Namespace) -> int:
+    db_path = Path(args.adl_db)
+    if not db_path.exists():
+        print(f"❌ DB not found: {db_path}", file=sys.stderr)
+        return 1
+    conn = sqlite3.connect(db_path, timeout=10)
+    conn.row_factory = sqlite3.Row
+    configure_sqlite(conn)
+    ensure_creators_table(conn)
+    ensure_creator_enrichment_table(conn)
+    ensure_brands_table(conn)
+    ensure_entity_normalized_table(conn)
+
+    entity_type = args.entity_type
+    ids: List[int] = []
+    if args.id:
+        ids = [args.id]
+    else:
+        if entity_type == "brand" and args.all_brands:
+            rows = conn.execute(
+                "SELECT adlid FROM brands LIMIT ? OFFSET ?",
+                (args.limit, args.offset),
+            ).fetchall()
+            ids = [r[0] for r in rows]
+        if entity_type == "creator" and args.all_creators:
+            rows = conn.execute(
+                "SELECT podcastindex_id FROM creators LIMIT ? OFFSET ?",
+                (args.limit, args.offset),
+            ).fetchall()
+            ids = [r[0] for r in rows]
+    if not ids:
+        print("❌ Provide --id or --all-brands/--all-creators", file=sys.stderr)
+        conn.close()
+        return 1
+
+    normalized = 0
+    for eid in ids:
+        exists = conn.execute(
+            "SELECT 1 FROM entity_normalized WHERE entity_type=? AND entity_id=? AND version='v1'",
+            (entity_type, eid),
+        ).fetchone()
+        if exists:
+            continue
+        name = ""
+        fields_parts: List[str] = []
+        if entity_type == "brand":
+            row = conn.execute("SELECT * FROM brands WHERE adlid=?", (eid,)).fetchone()
+            if not row:
+                continue
+            name = row["brand_name"] or f"brand {eid}"
+            for key in ["brand_summary", "brand_vertical", "brand_audience_profile", "brand_use_cases", "brand_pain_points", "brand_keywords", "source_website_raw", "source_linkedin_raw"]:
+                if row[key]:
+                    fields_parts.append(f"{key.upper()}: {row[key]}")
+        else:
+            row = conn.execute(
+                """
+                SELECT c.*, ce.cleaned_text_block, ce.raw_text_sources
+                FROM creators c
+                LEFT JOIN creator_enrichment ce ON ce.podcastindex_id = c.podcastindex_id
+                WHERE c.podcastindex_id=?
+                """,
+                (eid,),
+            ).fetchone()
+            if not row:
+                continue
+            name = row["title"] or f"podcast {eid}"
+            for key in ["title", "description", "categories", "cleaned_text_block"]:
+                if row.get(key) if isinstance(row, dict) else row[key]:
+                    fields_parts.append(f"{key.upper()}: {row[key]}")
+            try:
+                raw_sources = json.loads(row["raw_text_sources"]) if row["raw_text_sources"] else {}
+            except Exception:
+                raw_sources = {}
+            for k, v in (raw_sources or {}).items():
+                if v:
+                    fields_parts.append(f"{k.upper()}: {v}")
+        fields_text = "\n".join(fields_parts)
+        norm = normalize_entity_to_json(entity_type, name, fields_text)
+        if not norm or not norm.get("summary"):
+            print(f"⚠️ Normalization failed for {entity_type} {eid}")
+            continue
+        conn.execute(
+            """
+            INSERT OR REPLACE INTO entity_normalized (entity_type, entity_id, version, normalized_block, norm_fields)
+            VALUES (?, ?, 'v1', ?, ?)
+            """,
+            (entity_type, eid, norm.get("summary") or norm.get("summary_block") or "", json.dumps(norm)),
+        )
+        # persist normalized_* columns
+        topics_val = norm.get("topics")
+        if isinstance(topics_val, list):
+            topics_str = ",".join([t if isinstance(t, str) else t.get("apple_subcategory_id") or t.get("apple_category_id") or "" for t in topics_val])
+        else:
+            topics_str = topics_val or ""
+        if entity_type == "brand":
+            conn.execute(
+                """
+                UPDATE brands SET
+                    normalized_summary=?, normalized_vertical=?, normalized_audience=?, normalized_pain_points=?,
+                    normalized_use_cases=?, normalized_themes=?, normalized_tone=?, normalized_geo=?, normalized_topics=?
+                WHERE adlid=?
+                """,
+                (
+                    norm.get("summary"),
+                    norm.get("vertical"),
+                    norm.get("audience"),
+                    norm.get("pain_points"),
+                    norm.get("use_cases"),
+                    norm.get("themes"),
+                    norm.get("tone"),
+                    norm.get("geo"),
+                    topics_str,
+                    eid,
+                ),
+            )
+        else:
+            conn.execute(
+                """
+                UPDATE creators SET
+                    normalized_summary=?, normalized_vertical=?, normalized_audience=?, normalized_pain_points=?,
+                    normalized_use_cases=?, normalized_themes=?, normalized_tone=?, normalized_geo=?, normalized_topics=?
+                WHERE podcastindex_id=?
+                """,
+                (
+                    norm.get("summary"),
+                    norm.get("vertical"),
+                    norm.get("audience"),
+                    norm.get("pain_points"),
+                    norm.get("use_cases"),
+                    norm.get("themes"),
+                    norm.get("tone"),
+                    norm.get("geo"),
+                    topics_str,
+                    eid,
+                ),
+            )
+        normalized += 1
+        if normalized % 10 == 0:
+            conn.commit()
+            print(f"Normalized {normalized}/{len(ids)}...", end="\r")
+    conn.commit()
+    print(f"\n✅ Normalized {normalized} entities.")
+    conn.close()
+    return 0
+
+
+def build_embedding_text(entity: sqlite3.Row, entity_type: str, vector_type: str) -> Optional[str]:
+    summary = entity["normalized_summary"] or ""
+    vertical = entity["normalized_vertical"] or ""
+    audience = entity["normalized_audience"] or ""
+    pains = entity["normalized_pain_points"] or ""
+    use_cases = entity["normalized_use_cases"] or ""
+    themes = entity["normalized_themes"] or ""
+    tone = entity["normalized_tone"] or ""
+    geo = entity["normalized_geo"] or ""
+    topics = entity["normalized_topics"] or ""
+    if vector_type == "semantic_summary":
+        return f"SUMMARY:\n{summary}\nVERTICAL:\n{vertical}\nAUDIENCE:\n{audience}\nTHEMES:\n{themes}"
+    if vector_type == "topics":
+        return f"TOPICS (APPLE CATEGORIES):\n{topics}"
+    if vector_type == "vertical":
+        return f"INDUSTRY / VERTICAL:\n{vertical}"
+    if vector_type == "audience":
+        return f"AUDIENCE:\n{audience}\nGEO:\n{geo}"
+    if vector_type == "pain_points":
+        return f"PAIN POINTS:\n{pains}"
+    if vector_type == "use_cases":
+        return f"USE CASES:\n{use_cases}"
+    if vector_type == "themes":
+        return f"THEMES:\n{themes}"
+    if vector_type == "tone":
+        return f"TONE:\n{tone}"
+    if vector_type == "geo":
+        return f"GEO:\n{geo}"
+    return None
+
+
+def embed_entity(args: argparse.Namespace) -> int:
+    db_path = Path(args.adl_db)
+    if not db_path.exists():
+        print(f"❌ DB not found: {db_path}", file=sys.stderr)
+        return 1
+    conn = sqlite3.connect(db_path, timeout=10)
+    conn.row_factory = sqlite3.Row
+    configure_sqlite(conn)
+    ensure_entity_normalized_table(conn)
+    ensure_entity_embeddings_table(conn)
+    ensure_creators_table(conn)
+    ensure_brands_table(conn)
+
+    vector_types = [
+        "semantic_summary",
+        "topics",
+        "vertical",
+        "audience",
+        "pain_points",
+        "use_cases",
+        "themes",
+        "tone",
+        "geo",
+    ]
+    entity_type = args.entity_type
+    if args.id:
+        rows = conn.execute(
+            """
+            SELECT en.id as norm_id, en.normalized_block, c.*
+            FROM entity_normalized en
+            JOIN creators c ON c.podcastindex_id = en.entity_id
+            WHERE en.entity_type='creator' AND en.entity_id=? AND en.version='v1'
+            """ if entity_type == "creator" else
+            """
+            SELECT en.id as norm_id, en.normalized_block, b.*
+            FROM entity_normalized en
+            JOIN brands b ON b.adlid = en.entity_id
+            WHERE en.entity_type='brand' AND en.entity_id=? AND en.version='v1'
+            """,
+            (args.id,),
+        ).fetchall()
+    else:
+        rows = conn.execute(
+            """
+            SELECT en.id as norm_id, en.normalized_block, c.*
+            FROM entity_normalized en
+            JOIN creators c ON c.podcastindex_id = en.entity_id
+            WHERE en.entity_type='creator' AND en.version='v1'
+            """ if entity_type == "creator" else
+            """
+            SELECT en.id as norm_id, en.normalized_block, b.*
+            FROM entity_normalized en
+            JOIN brands b ON b.adlid = en.entity_id
+            WHERE en.entity_type='brand' AND en.version='v1'
+            """,
+            (),
+        ).fetchall()
+    if not rows:
+        print("No normalized records to embed.")
+        conn.close()
+        return 0
+    model_name = "text-embedding-3-large"
+    inserted = 0
+    for r in rows:
+        ent_id = r["podcastindex_id"] if entity_type == "creator" else r["adlid"]
+        conn.execute(
+            "DELETE FROM entity_embeddings WHERE entity_type=? AND entity_id=?",
+            (entity_type, ent_id),
+        )
+        for vt in vector_types:
+            text = build_embedding_text(r, entity_type, vt)
+            if not text or not text.strip():
+                continue
+            vec = embed_text_block(text)
+            if not vec:
+                continue
+            conn.execute(
+                """
+                INSERT INTO entity_embeddings (entity_type, entity_id, vector_type, embedding_vector, confidence, source_text, source_normalized_id, model_name)
+                VALUES (?, ?, ?, ?, ?, ?, ?, ?)
+                """,
+                (entity_type, ent_id, vt, json.dumps(vec), 1.0, text[:4000], r["norm_id"], model_name),
+            )
+            inserted += 1
+    conn.commit()
+    print(f"✅ Embedded {inserted} vectors for {len(rows)} {entity_type}(s).")
+    conn.close()
+    return 0
+
+
+def load_embeddings_map(conn: sqlite3.Connection, entity_type: str, entity_id: int) -> Dict[str, List[float]]:
+    rows = conn.execute(
+        """
+        SELECT vector_type, embedding_vector
+        FROM entity_embeddings
+        WHERE entity_type=? AND entity_id=?
+        """,
+        (entity_type, entity_id),
+    ).fetchall()
+    result = {}
+    for r in rows:
+        vec = parse_embedding(r["embedding_vector"])
+        if vec:
+            result[r["vector_type"]] = vec
+    return result
 
 def test_enrich(args: argparse.Namespace) -> int:
     db_path = Path(args.adl_db)
@@ -2736,6 +3260,111 @@ def rank_entities(args: argparse.Namespace) -> int:
         return 0
 
     print("❌ Must specify --bybrand or --bycreator", file=sys.stderr)
+    return 1
+
+
+# Override with multi-dimensional ranking using entity_embeddings
+def rank_entities(args: argparse.Namespace) -> int:
+    db_path = Path(args.adl_db)
+    if not db_path.exists():
+        print(f"❌ DB not found: {db_path}", file=sys.stderr)
+        return 1
+    conn = sqlite3.connect(db_path, timeout=10)
+    conn.row_factory = sqlite3.Row
+    configure_sqlite(conn)
+    ensure_entity_embeddings_table(conn)
+    limit = args.limit
+    adlid = args.adlid
+    weights = {
+        "semantic_summary": 0.25,
+        "audience": 0.25,
+        "pain_points": 0.15,
+        "vertical": 0.15,
+        "topics": 0.10,
+        "tone": 0.05,
+        "geo": 0.05,
+    }
+
+    def score_pair(bmap: Dict[str, List[float]], cmap: Dict[str, List[float]]) -> Tuple[float, Dict[str, float]]:
+        sims = {}
+        for vt, w in weights.items():
+            if vt in bmap and vt in cmap:
+                sims[vt] = cosine_similarity(bmap[vt], cmap[vt])
+        num = sum(sims.get(vt, 0) * w for vt, w in weights.items() if vt in sims)
+        denom = sum(w for vt, w in weights.items() if vt in sims)
+        return (num / denom if denom else 0.0), sims
+
+    if args.bybrand:
+        brand = conn.execute("SELECT adlid, brand_name FROM brands WHERE adlid = ?", (adlid,)).fetchone()
+        if not brand:
+            print(f"❌ Brand adlid {adlid} not found.", file=sys.stderr)
+            return 1
+        bmap = load_embeddings_map(conn, "brand", adlid)
+        if not bmap:
+            print(f"❌ No embeddings for brand adlid {adlid}. Run normalize-entity then embed-entity.", file=sys.stderr)
+            return 1
+        creator_rows = conn.execute(
+            """
+            SELECT c.podcastindex_id, c.title AS name
+            FROM creators c
+            WHERE EXISTS (SELECT 1 FROM entity_embeddings ee WHERE ee.entity_type='creator' AND ee.entity_id=c.podcastindex_id)
+            """
+        ).fetchall()
+        scored = []
+        for r in creator_rows:
+            cmap = load_embeddings_map(conn, "creator", r["podcastindex_id"])
+            if not cmap:
+                continue
+            final_score, sims = score_pair(bmap, cmap)
+            top_dims = sorted(sims.items(), key=lambda x: x[1], reverse=True)[:2]
+            notes = "; ".join([f"{d}:{v:.2f}" for d, v in top_dims])
+            scored.append((f"{r['podcastindex_id']}|{r['name'] or ''}", final_score, relevance_label(final_score), notes))
+        scored.sort(key=lambda x: x[1], reverse=True)
+        rows = scored[:limit]
+        print(f"Ranking by Brand: adlid={adlid}, brand=\"{brand['brand_name'] or ''}\"")
+        table = format_table(rows, ("podcast_title", "score", "relevance", "top_dims"))
+        print(table)
+        conn.close()
+        return 0
+
+    if args.bycreator:
+        creator = conn.execute(
+            "SELECT c.podcastindex_id, c.title AS name FROM creators c WHERE c.podcastindex_id = ?",
+            (adlid,),
+        ).fetchone()
+        if not creator:
+            print(f"❌ Creator adlid {adlid} not found.", file=sys.stderr)
+            return 1
+        cmap = load_embeddings_map(conn, "creator", adlid)
+        if not cmap:
+            print(f"❌ No embeddings for creator adlid {adlid}. Run normalize-entity then embed-entity.", file=sys.stderr)
+            return 1
+        brand_rows = conn.execute(
+            """
+            SELECT b.adlid, b.brand_name
+            FROM brands b
+            WHERE EXISTS (SELECT 1 FROM entity_embeddings ee WHERE ee.entity_type='brand' AND ee.entity_id=b.adlid)
+            """
+        ).fetchall()
+        scored = []
+        for r in brand_rows:
+            bmap = load_embeddings_map(conn, "brand", r["adlid"])
+            if not bmap:
+                continue
+            final_score, sims = score_pair(bmap, cmap)
+            top_dims = sorted(sims.items(), key=lambda x: x[1], reverse=True)[:2]
+            notes = "; ".join([f"{d}:{v:.2f}" for d, v in top_dims])
+            scored.append((f"{r['adlid']}|{r['brand_name'] or ''}", final_score, relevance_label(final_score), notes))
+        scored.sort(key=lambda x: x[1], reverse=True)
+        rows = scored[:limit]
+        print(f"Ranking by Creator: adlid={adlid}, podcast=\"{creator['name'] or ''}\"")
+        table = format_table(rows, ("brand_name", "score", "relevance", "notes"))
+        print(table)
+        conn.close()
+        return 0
+
+    print("❌ Must specify --bybrand or --bycreator", file=sys.stderr)
+    conn.close()
     return 1
 
 
@@ -3006,6 +3635,11 @@ def parse_args(argv: Optional[Sequence[str]] = None) -> argparse.Namespace:
         default=Path("adelined_matching.db"),
         help="Path to Adelined SQLite database (default: adelined_matching.db)",
     )
+    export_parser.add_argument(
+        "--usenorm",
+        action="store_true",
+        help="If set, export normalized text when available",
+    )
 
     rank_parser = subparsers.add_parser("rank", help="Rank creators vs brands via embeddings")
     rank_mode = rank_parser.add_mutually_exclusive_group(required=True)
@@ -3035,6 +3669,14 @@ def parse_args(argv: Optional[Sequence[str]] = None) -> argparse.Namespace:
     test_compare.add_argument("--text2", help="Second text input")
     test_compare.add_argument("--file1", type=Path, help="Path to first text file")
     test_compare.add_argument("--file2", type=Path, help="Path to second text file")
+    test_compare.add_argument("--brand-id", type=int, help="Compare using brand embeddings (adlid)")
+    test_compare.add_argument("--creator-id", type=int, help="Compare using creator embeddings (podcastindex_id)")
+    test_compare.add_argument(
+        "--adl-db",
+        type=Path,
+        default=Path("adelined_matching.db"),
+        help="Path to Adelined SQLite database (default: adelined_matching.db)",
+    )
 
     test_enrich = subparsers.add_parser("test-enrich", help="Dump enrichment for a creator")
     test_enrich.add_argument(
