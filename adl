@@ -80,6 +80,91 @@ class YouTubeChannelRecord:
     scraped_at: str
 
 
+# --- LLM / Embedding abstraction wrappers ---
+class LLMClient:
+    def __init__(self, provider: str = "openai", model: str = "gpt-4o-mini"):
+        self.provider = provider
+        self.model = model
+        self.api_key = os.getenv("OPENAI_API_KEY")
+
+    def normalize_entity(self, entity_type: str, name: str, fields_text: str) -> Optional[Dict]:
+        if self.provider != "openai" or not self.api_key:
+            return None
+        client = OpenAI(api_key=self.api_key)
+        schema = (
+            "{"
+            "\"summary\":\"...\","
+            "\"vertical\":\"...\","
+            "\"audience\":\"...\","
+            "\"pain_points\":\"...\","
+            "\"use_cases\":\"...\","
+            "\"themes\":\"...\","
+            "\"tone\":\"...\","
+            "\"geo\":\"...\","
+            "\"topics\":[{\"apple_category_name\":\"...\",\"apple_subcategory_name\":\"...\",\"apple_category_id\":\"...\",\"apple_subcategory_id\":\"...\"}]"
+            "}"
+        )
+        prompt = (
+            "You are a classification and summarisation assistant.\n"
+            "Normalize noisy marketing/technical text about an entity into a simple schema, using plain language a non-expert would understand.\n"
+            "Return JSON ONLY with keys: summary, vertical, audience, pain_points, use_cases, themes, tone, geo, topics (array as specified).\n"
+            "Be concise, high-signal, no fluff. Use common industry labels.\n\n"
+            f"ENTITY_TYPE: {entity_type}\n"
+            f"NAME: {name}\n"
+            f"RAW FIELDS:\n{fields_text}\n\n"
+            "Output JSON in this structure:\n"
+            + schema
+        )
+        try:
+            resp = client.chat.completions.create(
+                model=self.model,
+                messages=[{"role": "user", "content": prompt}],
+                temperature=0.1,
+                response_format={"type": "json_object"},
+            )
+            return json.loads(resp.choices[0].message.content)
+        except Exception as exc:
+            print(f"⚠️ Normalization failed: {exc}", file=sys.stderr)
+            return None
+
+    def explain_match(self, brand_profile: Dict, creator_profile: Dict, scores: Dict[str, float]) -> Optional[str]:
+        if self.provider != "openai" or not self.api_key:
+            return None
+        client = OpenAI(api_key=self.api_key)
+        prompt = (
+            "Given the normalized profiles of a brand and a creator plus per-dimension similarity scores, provide a short rationale (2 sentences) "
+            "on commercial fit. Keep it factual and concise.\n\n"
+            f"BRAND: {json.dumps(brand_profile)}\nCREATOR: {json.dumps(creator_profile)}\nSCORES: {json.dumps(scores)}"
+        )
+        try:
+            resp = client.chat.completions.create(
+                model=self.model,
+                messages=[{"role": "user", "content": prompt}],
+                temperature=0.3,
+            )
+            return resp.choices[0].message.content
+        except Exception:
+            return None
+
+
+class EmbeddingClient:
+    def __init__(self, provider: str = "openai", model: str = "text-embedding-3-large"):
+        self.provider = provider
+        self.model = model
+        self.api_key = os.getenv("OPENAI_API_KEY")
+
+    def embed(self, texts: List[str]) -> List[Optional[List[float]]]:
+        if self.provider != "openai" or not self.api_key:
+            return [None for _ in texts]
+        client = OpenAI(api_key=self.api_key)
+        try:
+            resp = client.embeddings.create(model=self.model, input=texts)
+            return [item.embedding for item in resp.data]
+        except Exception as exc:
+            print(f"⚠️ Embedding batch failed: {exc}", file=sys.stderr)
+            return [None for _ in texts]
+
+
 @dataclass
 class SpotifyShowRecord:
     show_url: str
@@ -380,11 +465,13 @@ def ensure_creator_enrichment_table(conn: sqlite3.Connection) -> None:
             source_social_patreon TEXT,
             cleaned_text_block TEXT,
             raw_text_sources TEXT,
+            normalized_text TEXT,
             created_at DATETIME DEFAULT CURRENT_TIMESTAMP,
             updated_at DATETIME DEFAULT CURRENT_TIMESTAMP
         )
         """
     )
+    ensure_column(conn, "creator_enrichment", "normalized_text", "TEXT")
 
 
 def ensure_column(conn: sqlite3.Connection, table: str, column: str, coltype: str) -> None:
@@ -547,6 +634,20 @@ def ensure_apple_categories_table(conn: sqlite3.Connection) -> None:
     )
     conn.execute(
         "CREATE INDEX IF NOT EXISTS idx_apple_cat_parent ON apple_podcast_categories(parent_apple_id)"
+    )
+
+
+def ensure_normalization_lexicon_table(conn: sqlite3.Connection) -> None:
+    conn.execute(
+        """
+        CREATE TABLE IF NOT EXISTS normalization_lexicon (
+            id INTEGER PRIMARY KEY AUTOINCREMENT,
+            raw_label TEXT,
+            normalized_label TEXT,
+            label_type TEXT,
+            notes TEXT
+        )
+        """
     )
 
 
@@ -2242,7 +2343,7 @@ NORMAL_VECTOR_TYPES = [
 ]
 
 
-def normalize_entity_to_json(entity_type: str, name: str, fields_text: str) -> Optional[Dict]:
+def normalize_entity_to_json(entity_type: str, name: str, fields_text: str, categories_hint: str = "") -> Optional[Dict]:
     key = os.getenv("OPENAI_API_KEY")
     if not key:
         return None
@@ -2268,6 +2369,7 @@ def normalize_entity_to_json(entity_type: str, name: str, fields_text: str) -> O
         f"ENTITY_TYPE: {entity_type}\n"
         f"NAME: {name}\n"
         f"RAW FIELDS:\n{fields_text}\n\n"
+        f"Apple Podcast categories (examples):\n{categories_hint}\n\n"
         "Output JSON in this structure:\n"
         + schema
     )
@@ -2774,16 +2876,16 @@ def normalize_entities(args: argparse.Namespace) -> int:
 
     entity_type = args.entity_type
     ids: List[int] = []
-    if args.id:
+    if getattr(args, "id", None):
         ids = [args.id]
     else:
-        if entity_type == "brand" and args.all_brands:
+        if entity_type == "brand" and getattr(args, "all_brands", False):
             rows = conn.execute(
                 "SELECT adlid FROM brands LIMIT ? OFFSET ?",
                 (args.limit, args.offset),
             ).fetchall()
             ids = [r[0] for r in rows]
-        if entity_type == "creator" and args.all_creators:
+        if entity_type == "creator" and getattr(args, "all_creators", False):
             rows = conn.execute(
                 "SELECT podcastindex_id FROM creators LIMIT ? OFFSET ?",
                 (args.limit, args.offset),
@@ -2793,6 +2895,12 @@ def normalize_entities(args: argparse.Namespace) -> int:
         print("❌ Provide --id or --all-brands/--all-creators", file=sys.stderr)
         conn.close()
         return 1
+
+    # Provide a short hint list of Apple categories if present
+    cat_rows = conn.execute(
+        "SELECT full_path FROM apple_podcast_categories LIMIT 30"
+    ).fetchall()
+    categories_hint = "\n".join([r["full_path"] for r in cat_rows]) if cat_rows else ""
 
     normalized = 0
     for eid in ids:
@@ -2836,23 +2944,47 @@ def normalize_entities(args: argparse.Namespace) -> int:
                 if v:
                     fields_parts.append(f"{k.upper()}: {v}")
         fields_text = "\n".join(fields_parts)
-        norm = normalize_entity_to_json(entity_type, name, fields_text)
+        norm = normalize_entity_to_json(entity_type, name, fields_text, categories_hint)
         if not norm or not norm.get("summary"):
             print(f"⚠️ Normalization failed for {entity_type} {eid}")
             continue
+        topics_val = norm.get("topics")
+        if isinstance(topics_val, list):
+            topics_str = ",".join(
+                [
+                    t
+                    if isinstance(t, str)
+                    else t.get("apple_subcategory_id")
+                    or t.get("apple_category_id")
+                    or t.get("apple_subcategory_name")
+                    or t.get("apple_category_name")
+                    or ""
+                    for t in topics_val
+                ]
+            )
+        else:
+            topics_str = topics_val or ""
+        # Build a canonical normalized block for reference/embedding
+        block_parts = [
+            f"SUMMARY:\n{norm.get('summary','')}",
+            f"VERTICAL:\n{norm.get('vertical','')}",
+            f"AUDIENCE:\n{norm.get('audience','')}",
+            f"PAIN_POINTS:\n{norm.get('pain_points','')}",
+            f"USE_CASES:\n{norm.get('use_cases','')}",
+            f"THEMES:\n{norm.get('themes','')}",
+            f"TONE:\n{norm.get('tone','')}",
+            f"GEO:\n{norm.get('geo','')}",
+            f"TOPICS:\n{topics_str}",
+        ]
+        normalized_block = "\n".join(block_parts)
         conn.execute(
             """
             INSERT OR REPLACE INTO entity_normalized (entity_type, entity_id, version, normalized_block, norm_fields)
             VALUES (?, ?, 'v1', ?, ?)
             """,
-            (entity_type, eid, norm.get("summary") or norm.get("summary_block") or "", json.dumps(norm)),
+            (entity_type, eid, normalized_block, json.dumps(norm)),
         )
         # persist normalized_* columns
-        topics_val = norm.get("topics")
-        if isinstance(topics_val, list):
-            topics_str = ",".join([t if isinstance(t, str) else t.get("apple_subcategory_id") or t.get("apple_category_id") or "" for t in topics_val])
-        else:
-            topics_str = topics_val or ""
         if entity_type == "brand":
             conn.execute(
                 """
@@ -2961,37 +3093,40 @@ def embed_entity(args: argparse.Namespace) -> int:
         "geo",
     ]
     entity_type = args.entity_type
+    # Optional bulk delete for this entity type
+    if getattr(args, "refreshall", False):
+        confirm = input(f"Type YES to delete all embeddings for {entity_type}s: ").strip()
+        if confirm != "YES":
+            print("Aborted.")
+            conn.close()
+            return 1
+        conn.execute("DELETE FROM entity_embeddings WHERE entity_type=?", (entity_type,))
+        conn.commit()
+        print(f"🗑️ Deleted all {entity_type} embeddings.")
+
+    base_query_creator = """
+        SELECT en.id as norm_id, en.normalized_block, c.*
+        FROM entity_normalized en
+        JOIN creators c ON c.podcastindex_id = en.entity_id
+        WHERE en.entity_type='creator' AND en.version='v1'
+    """
+    base_query_brand = """
+        SELECT en.id as norm_id, en.normalized_block, b.*
+        FROM entity_normalized en
+        JOIN brands b ON b.adlid = en.entity_id
+        WHERE en.entity_type='brand' AND en.version='v1'
+    """
+
+    rows: List[sqlite3.Row]
     if args.id:
         rows = conn.execute(
-            """
-            SELECT en.id as norm_id, en.normalized_block, c.*
-            FROM entity_normalized en
-            JOIN creators c ON c.podcastindex_id = en.entity_id
-            WHERE en.entity_type='creator' AND en.entity_id=? AND en.version='v1'
-            """ if entity_type == "creator" else
-            """
-            SELECT en.id as norm_id, en.normalized_block, b.*
-            FROM entity_normalized en
-            JOIN brands b ON b.adlid = en.entity_id
-            WHERE en.entity_type='brand' AND en.entity_id=? AND en.version='v1'
-            """,
+            base_query_creator + " AND en.entity_id=?" if entity_type == "creator" else base_query_brand + " AND en.entity_id=?",
             (args.id,),
         ).fetchall()
     else:
         rows = conn.execute(
-            """
-            SELECT en.id as norm_id, en.normalized_block, c.*
-            FROM entity_normalized en
-            JOIN creators c ON c.podcastindex_id = en.entity_id
-            WHERE en.entity_type='creator' AND en.version='v1'
-            """ if entity_type == "creator" else
-            """
-            SELECT en.id as norm_id, en.normalized_block, b.*
-            FROM entity_normalized en
-            JOIN brands b ON b.adlid = en.entity_id
-            WHERE en.entity_type='brand' AND en.version='v1'
-            """,
-            (),
+            (base_query_creator if entity_type == "creator" else base_query_brand) + " LIMIT ? OFFSET ?",
+            (args.limit, args.offset),
         ).fetchall()
     if not rows:
         print("No normalized records to embed.")
@@ -3611,6 +3746,47 @@ def parse_args(argv: Optional[Sequence[str]] = None) -> argparse.Namespace:
         help="Delete existing vectors for the chosen target before embedding (requires typing YES)",
     )
 
+    norm_entity_parser = subparsers.add_parser("normalize-entity", help="Normalize a brand or creator into structured fields")
+    norm_entity_parser.add_argument(
+        "--entity-type",
+        required=True,
+        choices=["brand", "creator"],
+        help="Which entity type to normalize",
+    )
+    norm_entity_parser.add_argument("--id", type=int, help="Specific id (adlid for brand, podcastindex_id for creator)")
+    norm_entity_parser.add_argument("--all-brands", action="store_true", help="Normalize all brands (paged with limit/offset)")
+    norm_entity_parser.add_argument("--all-creators", action="store_true", help="Normalize all creators (paged with limit/offset)")
+    norm_entity_parser.add_argument("--limit", type=int, default=100, help="Max rows to process (default 100)")
+    norm_entity_parser.add_argument("--offset", type=int, default=0, help="Offset for bulk mode")
+    norm_entity_parser.add_argument(
+        "--adl-db",
+        type=Path,
+        default=Path("adelined_matching.db"),
+        help="Path to Adelined SQLite database (default: adelined_matching.db)",
+    )
+
+    embed_entity_parser = subparsers.add_parser("embed-entity", help="Embed normalized brands or creators into per-dimension vectors")
+    embed_entity_parser.add_argument(
+        "--entity-type",
+        required=True,
+        choices=["brand", "creator"],
+        help="Which entity type to embed",
+    )
+    embed_entity_parser.add_argument("--id", type=int, help="Specific id (adlid for brand, podcastindex_id for creator)")
+    embed_entity_parser.add_argument("--limit", type=int, default=100, help="Max rows to embed (default 100)")
+    embed_entity_parser.add_argument("--offset", type=int, default=0, help="Offset for bulk mode")
+    embed_entity_parser.add_argument(
+        "--refreshall",
+        action="store_true",
+        help="Delete existing embeddings for this entity type before embedding (requires typing YES)",
+    )
+    embed_entity_parser.add_argument(
+        "--adl-db",
+        type=Path,
+        default=Path("adelined_matching.db"),
+        help="Path to Adelined SQLite database (default: adelined_matching.db)",
+    )
+
     export_parser = subparsers.add_parser("export", help="Export a stored embedding text block to a file")
     export_parser.add_argument(
         "--target",
@@ -3780,6 +3956,10 @@ def main(argv: Optional[Sequence[str]] = None) -> int:
         return ingest_brand(args)
     if args.action == "embed":
         return embed_entities(args)
+    if args.action == "normalize-entity":
+        return normalize_entities(args)
+    if args.action == "embed-entity":
+        return embed_entity(args)
     if args.action == "rank":
         return rank_entities(args)
     if args.action == "test-compare":
@@ -3788,7 +3968,8 @@ def main(argv: Optional[Sequence[str]] = None) -> int:
         return test_enrich(args)
     if args.action == "export":
         return export_entity(args)
-    print(f"Unknown action/source combination: {args.action} {args.source}")
+    source = getattr(args, "source", "")
+    print(f"Unknown action/source combination: {args.action} {source}")
     return 1
 
 
@@ -3806,6 +3987,8 @@ Commands:
   python3 adl enrichment show [options]
   python3 adl enrichment summary [options]
   python3 adl brand --url <website>
+  python3 adl normalize-entity --entity-type brand|creator [--id <id> | --all-brands/--all-creators]
+  python3 adl embed-entity --entity-type brand|creator [--id <id> | --limit N --offset M]
   python3 adl embed [creators|brands] [options]
   python3 adl rank --bybrand/--bycreator --adlid <id> [options]
   python3 adl test-compare --text1/--file1 --text2/--file2
@@ -3834,6 +4017,10 @@ Examples:
   # Enrich a slice of creators
   python3 adl enrich --adl-db adelined_matching.db --limit 50 --offset 0
   python3 adl enrich --adl-db adelined_matching.db --only-id 12345
+
+  # Normalize and embed (multi-vector)
+  python3 adl normalize-entity --entity-type brand --all-brands --limit 50
+  python3 adl embed-entity --entity-type brand --limit 50
   # Ingest a brand (scrape + GPT extract)
   python3 adl brand --url https://brandsite.com
   # Embed creators or brands (OpenAI embedding)
