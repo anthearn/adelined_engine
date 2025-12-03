@@ -27,6 +27,12 @@ from openai import OpenAI
 
 load_dotenv()
 
+# OpenAI confirmation (one per command run)
+OPENAI_CONFIRMED = False
+
+LOCAL_OLLAMA_MODEL = os.getenv("OLLAMA_MODEL", "phi3.5")
+OLLAMA_HOST = os.getenv("OLLAMA_HOST", "http://localhost:11434")
+
 PODCASTINDEX_COLUMNS: Sequence[str] = [
     "id",
     "url",
@@ -131,6 +137,8 @@ class LLMClient:
     def explain_match(self, brand_profile: Dict, creator_profile: Dict, scores: Dict[str, float]) -> Optional[str]:
         if self.provider != "openai" or not self.api_key:
             return None
+        if not ensure_openai_confirmation("match explanation", allow_fallback=False):
+            return None
         client = OpenAI(api_key=self.api_key)
         prompt = (
             "Given the normalized profiles of a brand and a creator plus per-dimension similarity scores, provide a short rationale (2 sentences) "
@@ -164,6 +172,42 @@ class EmbeddingClient:
         except Exception as exc:
             print(f"⚠️ Embedding batch failed: {exc}", file=sys.stderr)
             return [None for _ in texts]
+
+
+def ensure_openai_confirmation(action: str, allow_fallback: bool = False) -> bool:
+    """
+    Returns True if OpenAI can be used (confirmed), False if fallback should occur.
+    """
+    global OPENAI_CONFIRMED
+    if OPENAI_CONFIRMED:
+        return True
+    key = os.getenv("OPENAI_API_KEY")
+    if not key:
+        print("❌ OPENAI_API_KEY not set.", file=sys.stderr)
+        return False
+    prompt = (
+        f"⚠️ You are about to use the OpenAI API for: {action}. This may incur cost.\n"
+        'Type YES to continue, anything else to abort: '
+    )
+    resp = input(prompt).strip()
+    if resp == "YES":
+        OPENAI_CONFIRMED = True
+        return True
+    if allow_fallback:
+        print("↩️ OpenAI not confirmed; falling back to local provider.")
+        return False
+    print("Aborted; OpenAI not confirmed.")
+    return False
+
+
+def ensure_ollama_running() -> bool:
+    try:
+        res = requests.get(f"{OLLAMA_HOST}/api/version", timeout=5)
+        res.raise_for_status()
+        return True
+    except Exception:
+        print('❌ Ollama server not running — start with "ollama serve"', file=sys.stderr)
+        return False
 
 
 @dataclass
@@ -2345,6 +2389,8 @@ def extract_creator_metadata(raw_text: str) -> Dict:
     """
     Use GPT to extract structured creator metadata for embeddings.
     """
+    if not ensure_openai_confirmation("creator metadata extraction", allow_fallback=False):
+        return {}
     key = os.getenv("OPENAI_API_KEY")
     if not key:
         return {}
@@ -2392,11 +2438,15 @@ NORMAL_VECTOR_TYPES = [
 ]
 
 
-def normalize_entity_to_json(entity_type: str, name: str, fields_text: str, categories_hint: str = "") -> Optional[Dict]:
-    key = os.getenv("OPENAI_API_KEY")
-    if not key:
-        return None
-    client = OpenAI(api_key=key)
+def normalize_entity_to_json(
+    entity_type: str,
+    name: str,
+    fields_text: str,
+    categories_hint: str = "",
+    provider: str = "local",
+    model: str = LOCAL_OLLAMA_MODEL,
+    debug_tag: str = "",
+) -> Optional[Dict]:
     schema = (
         "{"
         "\"summary\":\"...\","  # summary of what they are/do
@@ -2415,6 +2465,7 @@ def normalize_entity_to_json(entity_type: str, name: str, fields_text: str, cate
         "Normalize noisy marketing/technical text about an entity into a simple schema, using plain language a non-expert would understand.\n"
         "Return JSON ONLY with keys: summary, vertical, audience, pain_points, use_cases, themes, tone, geo, topics (array as specified).\n"
         "Be concise, high-signal, no fluff. Use common industry labels.\n"
+        "Output MUST be valid JSON (no trailing commas, close all brackets/quotes). Keep lists short (max 3 items each).\n"
         "If multiple positions appear, prefer the CURRENT go-to-market positioning.\n"
         "Do not hallucinate missing facts; leave fields short and generic instead.\n\n"
         f"ENTITY_TYPE: {entity_type}\n"
@@ -2424,17 +2475,104 @@ def normalize_entity_to_json(entity_type: str, name: str, fields_text: str, cate
         "Output JSON in this structure:\n"
         + schema
     )
-    try:
-        resp = client.chat.completions.create(
-            model="gpt-4o-mini",
-            messages=[{"role": "user", "content": prompt}],
-            temperature=0.1,
-            response_format={"type": "json_object"},
-        )
-        return json.loads(resp.choices[0].message.content)
-    except Exception as exc:
-        print(f"⚠️ Normalization failed: {exc}", file=sys.stderr)
+    if provider == "openai":
+        if not ensure_openai_confirmation("normalization", allow_fallback=False):
+            return None
+        key = os.getenv("OPENAI_API_KEY")
+        if not key:
+            print("❌ OPENAI_API_KEY not set.", file=sys.stderr)
+            return None
+        client = OpenAI(api_key=key)
+        try:
+            resp = client.chat.completions.create(
+                model="gpt-4o-mini",
+                messages=[{"role": "user", "content": prompt}],
+                temperature=0.1,
+                response_format={"type": "json_object"},
+            )
+            return json.loads(resp.choices[0].message.content)
+        except Exception as exc:
+            print(f"⚠️ Normalization failed: {exc}", file=sys.stderr)
+            return None
+    # local via Ollama
+    text = ollama_generate(prompt, model)
+    if not text:
         return None
+    # Clean code fences / extra text
+    cleaned = text.strip()
+    for fence in ("```json", "```", "`"):
+        cleaned = cleaned.replace(fence, "")
+
+    def try_parse(val: str) -> Optional[Dict]:
+        try:
+            return json.loads(val)
+        except Exception:
+            return None
+
+    def balance(text: str) -> str:
+        open_curly = text.count("{")
+        close_curly = text.count("}")
+        open_brack = text.count("[")
+        close_brack = text.count("]")
+        fix = text
+        fix += "}" * max(0, open_curly - close_curly)
+        fix += "]" * max(0, open_brack - close_brack)
+        return fix
+
+    def clean_trailing(val: str) -> str:
+        # Replace trailing colon with empty array to close fields
+        val = re.sub(r":\s*$", ": []", val.strip())
+        # Drop trailing commas before closing braces/brackets
+        val = re.sub(r",\s*([}\]])", r"\1", val)
+        return val
+
+    def truncate_to_last_block(val: str) -> str:
+        # Cut off trailing incomplete field by trimming after last closing brace/bracket
+        last_brace = val.rfind("}")
+        last_brack = val.rfind("]")
+        end = max(last_brace, last_brack)
+        if end != -1:
+            return val[: end + 1]
+        return val
+
+    parsed = try_parse(cleaned)
+    if parsed is None:
+        start = cleaned.find("{")
+        end = cleaned.rfind("}")
+        if start != -1 and end != -1 and end > start:
+            candidate = cleaned[start : end + 1]
+            parsed = try_parse(candidate)
+    if parsed is None:
+        fixed = truncate_to_last_block(cleaned)
+        fixed = clean_trailing(fixed)
+        fixed = balance(fixed)
+        parsed = try_parse(fixed)
+    if parsed is None:
+        # Iteratively drop the last line and retry a few times to remove truncated tails
+        tmp = cleaned
+        for _ in range(3):
+            if "\n" in tmp:
+                tmp = "\n".join(tmp.split("\n")[:-1])
+            else:
+                tmp = tmp[:-1]
+            fixed = truncate_to_last_block(tmp)
+            fixed = clean_trailing(fixed)
+            fixed = balance(fixed)
+            parsed = try_parse(fixed)
+            if parsed is not None:
+                break
+    if parsed is None:
+        excerpt = cleaned[:400]
+        print(f"⚠️ Normalization ({provider}) parse failed for {debug_tag or 'entity'}; excerpt:\n{excerpt}\n", file=sys.stderr)
+        try:
+            out_dir = Path("tests")
+            out_dir.mkdir(parents=True, exist_ok=True)
+            with (out_dir / "normalize_failures.log").open("a") as f:
+                f.write(f"{datetime.utcnow().isoformat()} | {debug_tag or entity_type} | provider={provider} | model={model}\n")
+                f.write(excerpt + "\n\n")
+        except Exception:
+            pass
+    return parsed
 
 
 def build_brand_text_block(row: sqlite3.Row) -> str:
@@ -2460,22 +2598,46 @@ def build_brand_text_block(row: sqlite3.Row) -> str:
     return "\n".join(parts)
 
 
-def embed_text_block(text: str) -> Optional[List[float]]:
+def embed_text_block(text: str, provider: str = "local", model: str = "text-embedding-3-large") -> Optional[List[float]]:
     if not text:
         return None
-    key = os.getenv("OPENAI_API_KEY")
-    if not key:
-        print("❌ OPENAI_API_KEY not set; cannot embed.", file=sys.stderr)
+    if provider == "openai":
+        if not ensure_openai_confirmation("embeddings", allow_fallback=False):
+            return None
+        key = os.getenv("OPENAI_API_KEY")
+        if not key:
+            print("❌ OPENAI_API_KEY not set; cannot embed.", file=sys.stderr)
+            return None
+        client = OpenAI(api_key=key)
+        try:
+            resp = client.embeddings.create(
+                model=model,
+                input=text,
+            )
+            return resp.data[0].embedding
+        except Exception as exc:
+            print(f"⚠️ Embedding failed: {exc}", file=sys.stderr)
+            return None
+    # Local embedding via Ollama
+    if not ensure_ollama_running():
         return None
-    client = OpenAI(api_key=key)
     try:
-        resp = client.embeddings.create(
-            model="text-embedding-3-large",
-            input=text,
+        res = requests.post(
+            f"{OLLAMA_HOST}/api/embed",
+            json={"model": model, "input": text},
+            timeout=120,
         )
-        return resp.data[0].embedding
+        if res.status_code == 404:
+            print("❌ Ollama embeddings endpoint not available (404). Ensure your Ollama version supports /api/embed or use --openai.", file=sys.stderr)
+            return None
+        res.raise_for_status()
+        data = res.json()
+        vec = data.get("embedding") or data.get("embeddings")
+        if not vec:
+            print("⚠️ Ollama embeddings response missing 'embedding' field.", file=sys.stderr)
+        return vec
     except Exception as exc:
-        print(f"⚠️ Embedding failed: {exc}", file=sys.stderr)
+        print(f"⚠️ Local embedding failed: {exc}", file=sys.stderr)
         return None
 
 
@@ -2488,9 +2650,13 @@ def parse_embedding(text: str) -> Optional[List[float]]:
 
 # ---- Lexicon / taxonomy helpers ----
 def map_label_from_lexicon(conn: sqlite3.Connection, raw_label: Optional[str]) -> Optional[str]:
-    if not raw_label:
-        return raw_label
-    raw = raw_label.strip()
+    if raw_label is None:
+        return None
+    if isinstance(raw_label, list):
+        raw = ", ".join(str(x) for x in raw_label if x)
+    else:
+        raw = str(raw_label)
+    raw = raw.strip()
     if not raw:
         return raw
     row = conn.execute(
@@ -2507,11 +2673,41 @@ def map_label_from_lexicon(conn: sqlite3.Connection, raw_label: Optional[str]) -
     return raw
 
 
-def simplify_entity_text(entity_type: str, name: str, raw_text: str) -> Optional[str]:
-    key = os.getenv("OPENAI_API_KEY")
-    if not key or not raw_text:
+def ollama_generate(prompt: str, model: str) -> Optional[str]:
+    if not ensure_ollama_running():
+        return None
+    try:
+        res = requests.post(
+            f"{OLLAMA_HOST}/api/generate",
+            json={
+                "model": model,
+                "prompt": prompt,
+                "format": "json",
+                "options": {"num_predict": 1024, "stop": ["\n\n", "\n###"]},
+            },
+            stream=True,
+            timeout=120,
+        )
+        res.raise_for_status()
+        chunks = []
+        for line in res.iter_lines():
+            if not line:
+                continue
+            try:
+                obj = json.loads(line.decode("utf-8"))
+                if "response" in obj:
+                    chunks.append(obj["response"])
+            except Exception:
+                continue
+        return "".join(chunks).strip()
+    except Exception as exc:
+        print(f"⚠️ Ollama request failed: {exc}", file=sys.stderr)
+        return None
+
+
+def simplify_entity_text(entity_type: str, name: str, raw_text: str, provider: str, model: str) -> Optional[str]:
+    if not raw_text:
         return raw_text
-    client = OpenAI(api_key=key)
     prompt = (
         "Rewrite the following noisy text into a short, plain-language description.\n"
         "Keep only high-signal details: what it is, who it's for, core topics/offerings.\n"
@@ -2521,15 +2717,25 @@ def simplify_entity_text(entity_type: str, name: str, raw_text: str) -> Optional
         f"NAME: {name}\n"
         f"RAW TEXT:\n{raw_text}\n"
     )
-    try:
-        resp = client.chat.completions.create(
-            model="gpt-4o-mini",
-            messages=[{"role": "user", "content": prompt}],
-            temperature=0.2,
-        )
-        return resp.choices[0].message.content.strip()
-    except Exception:
-        return raw_text
+    if provider == "openai":
+        if not ensure_openai_confirmation("entity simplification", allow_fallback=False):
+            return raw_text
+        key = os.getenv("OPENAI_API_KEY")
+        if not key:
+            return raw_text
+        client = OpenAI(api_key=key)
+        try:
+            resp = client.chat.completions.create(
+                model="gpt-4o-mini",
+                messages=[{"role": "user", "content": prompt}],
+                temperature=0.2,
+            )
+            return resp.choices[0].message.content.strip()
+        except Exception:
+            return raw_text
+    # local / ollama
+    text = ollama_generate(prompt, model)
+    return text or raw_text
 
 
 def map_topics_to_apple(conn: sqlite3.Connection, topics_val) -> str:
@@ -2544,20 +2750,31 @@ def map_topics_to_apple(conn: sqlite3.Connection, topics_val) -> str:
     rows = conn.execute("SELECT name, full_path FROM apple_podcast_categories").fetchall()
     names = {r["name"].lower(): r["full_path"] for r in rows}
     collected: List[str] = []
-    if isinstance(topics_val, list):
-        for t in topics_val:
-            if isinstance(t, str):
-                key = t.lower()
-            else:
-                key = (t.get("apple_subcategory_name") or t.get("apple_category_name") or t.get("apple_category_id") or "").lower()
-            if key in names:
-                collected.append(names[key])
-            elif key:
-                collected.append(key)
-    else:
-        key = str(topics_val).lower()
+    def handle_item(item):
+        if isinstance(item, list):
+            for sub in item:
+                handle_item(sub)
+            return
+        if isinstance(item, str):
+            key = item.lower()
+        elif isinstance(item, dict):
+            key = (
+                item.get("apple_subcategory_name")
+                or item.get("apple_category_name")
+                or item.get("apple_category_id")
+                or ""
+            ).lower()
+        else:
+            key = str(item).lower()
         if key in names:
             collected.append(names[key])
+        elif key:
+            collected.append(key)
+
+    if isinstance(topics_val, list):
+        handle_item(topics_val)
+    else:
+        handle_item(topics_val)
     return ",".join(collected)
 
 
@@ -2860,6 +3077,8 @@ def normalize_entities(args: argparse.Namespace) -> int:
     ensure_apple_categories_table(conn)
 
     entity_type = args.entity_type
+    provider = getattr(args, "llm_provider", "local")
+    ollama_model = getattr(args, "ollama_model", LOCAL_OLLAMA_MODEL)
     ids: List[int] = []
     if getattr(args, "id", None):
         ids = [args.id]
@@ -2901,13 +3120,19 @@ def normalize_entities(args: argparse.Namespace) -> int:
     ).fetchall()
     categories_hint = "\n".join([r["full_path"] for r in cat_rows]) if cat_rows else ""
 
+    # If provider is openai, confirm once; if declined and fallback allowed, switch to local.
+    if provider == "openai":
+        if not ensure_openai_confirmation("normalization", allow_fallback=True):
+            provider = "local"
+
     normalized = 0
+    attempted = 0
     for eid in ids:
         exists = conn.execute(
             "SELECT 1 FROM entity_normalized WHERE entity_type=? AND entity_id=? AND version='v1'",
             (entity_type, eid),
         ).fetchone()
-        if exists:
+        if exists and not getattr(args, "force", False):
             continue
         name = ""
         fields_parts: List[str] = []
@@ -2943,18 +3168,19 @@ def normalize_entities(args: argparse.Namespace) -> int:
                 if v:
                     fields_parts.append(f"{k.upper()}: {v}")
         raw_blob = "\n".join(fields_parts)
-        simplified = simplify_entity_text(entity_type, name, raw_blob) or raw_blob
+        if len(raw_blob) > 12000:
+            raw_blob = raw_blob[:12000]
+        simplified = simplify_entity_text(entity_type, name, raw_blob, provider, ollama_model) or raw_blob
         fields_text = f"SIMPLIFIED:\n{simplified}\n\nRAW:\n{raw_blob}"
-        norm = normalize_entity_to_json(entity_type, name, fields_text, categories_hint)
+        debug_tag = f"{entity_type}:{eid}"
+        attempted += 1
+        norm = normalize_entity_to_json(entity_type, name, fields_text, categories_hint, provider=provider, model=ollama_model, debug_tag=debug_tag)
         if not norm or not norm.get("summary"):
             print(f"⚠️ Normalization failed for {entity_type} {eid}")
             continue
-        # Map labels through lexicon where possible
-        norm["vertical"] = map_label_from_lexicon(conn, norm.get("vertical"))
-        norm["audience"] = map_label_from_lexicon(conn, norm.get("audience"))
-        norm["themes"] = map_label_from_lexicon(conn, norm.get("themes"))
-        norm["use_cases"] = map_label_from_lexicon(conn, norm.get("use_cases"))
-        norm["pain_points"] = map_label_from_lexicon(conn, norm.get("pain_points"))
+        # Coerce and map labels through lexicon where possible
+        for key in ["vertical", "audience", "themes", "use_cases", "pain_points", "tone", "geo"]:
+            norm[key] = map_label_from_lexicon(conn, norm.get(key))
         topics_val = norm.get("topics")
         topics_str = map_topics_to_apple(conn, topics_val)
         # Build a canonical normalized block for reference/embedding
@@ -2978,6 +3204,13 @@ def normalize_entities(args: argparse.Namespace) -> int:
             (entity_type, eid, normalized_block, json.dumps(norm)),
         )
         # persist normalized_* columns
+        def to_str(val):
+            if val is None:
+                return None
+            if isinstance(val, list):
+                return ", ".join(str(x) for x in val if x)
+            return str(val)
+
         if entity_type == "brand":
             conn.execute(
                 """
@@ -2987,15 +3220,15 @@ def normalize_entities(args: argparse.Namespace) -> int:
                 WHERE adlid=?
                 """,
                 (
-                    norm.get("summary"),
-                    norm.get("vertical"),
-                    norm.get("audience"),
-                    norm.get("pain_points"),
-                    norm.get("use_cases"),
-                    norm.get("themes"),
-                    norm.get("tone"),
-                    norm.get("geo"),
-                    topics_str,
+                    to_str(norm.get("summary")),
+                    to_str(norm.get("vertical")),
+                    to_str(norm.get("audience")),
+                    to_str(norm.get("pain_points")),
+                    to_str(norm.get("use_cases")),
+                    to_str(norm.get("themes")),
+                    to_str(norm.get("tone")),
+                    to_str(norm.get("geo")),
+                    to_str(topics_str),
                     eid,
                 ),
             )
@@ -3008,15 +3241,15 @@ def normalize_entities(args: argparse.Namespace) -> int:
                 WHERE podcastindex_id=?
                 """,
                 (
-                    norm.get("summary"),
-                    norm.get("vertical"),
-                    norm.get("audience"),
-                    norm.get("pain_points"),
-                    norm.get("use_cases"),
-                    norm.get("themes"),
-                    norm.get("tone"),
-                    norm.get("geo"),
-                    topics_str,
+                    to_str(norm.get("summary")),
+                    to_str(norm.get("vertical")),
+                    to_str(norm.get("audience")),
+                    to_str(norm.get("pain_points")),
+                    to_str(norm.get("use_cases")),
+                    to_str(norm.get("themes")),
+                    to_str(norm.get("tone")),
+                    to_str(norm.get("geo")),
+                    to_str(topics_str),
                     eid,
                 ),
             )
@@ -3025,7 +3258,7 @@ def normalize_entities(args: argparse.Namespace) -> int:
             conn.commit()
             print(f"Normalized {normalized}/{len(ids)}...", end="\r")
     conn.commit()
-    print(f"\n✅ Normalized {normalized} entities.")
+    print(f"\n✅ Normalized {normalized} entities of {attempted} attempted.")
     conn.close()
     return 0
 
@@ -3107,6 +3340,14 @@ def embed_entity(args: argparse.Namespace) -> int:
         "geo",
     ]
     entity_type = args.entity_type
+    embedding_provider = "openai" if getattr(args, "openai", False) else getattr(args, "embedding_provider", "local")
+    embedding_model = getattr(args, "embedding_model", LOCAL_OLLAMA_MODEL)
+    if embedding_provider == "openai":
+        if not ensure_openai_confirmation("embeddings", allow_fallback=False):
+            conn.close()
+            return 1
+        if not embedding_model or embedding_model == LOCAL_OLLAMA_MODEL:
+            embedding_model = "text-embedding-3-large"
     # Optional bulk delete for this entity type
     if getattr(args, "refreshall", False):
         confirm = input(f"Type YES to delete all embeddings for {entity_type}s: ").strip()
@@ -3159,7 +3400,7 @@ def embed_entity(args: argparse.Namespace) -> int:
             text = build_embedding_text(r, entity_type, vt)
             if not text or not text.strip():
                 continue
-            vec = embed_text_block(text)
+            vec = embed_text_block(text, provider=embedding_provider, model=embedding_model)
             if not vec:
                 continue
             conn.execute(
@@ -3288,8 +3529,10 @@ def test_enrich(args: argparse.Namespace) -> int:
 
 
 def cosine_similarity(a: List[float], b: List[float]) -> float:
-    va = np.array(a, dtype=float)
-    vb = np.array(b, dtype=float)
+    va = np.array(a, dtype=float).ravel()
+    vb = np.array(b, dtype=float).ravel()
+    if va.shape != vb.shape or va.size == 0:
+        return 0.0
     denom = (np.linalg.norm(va) * np.linalg.norm(vb))
     if denom == 0:
         return 0.0
@@ -3661,6 +3904,22 @@ def parse_args(argv: Optional[Sequence[str]] = None) -> argparse.Namespace:
     norm_entity_parser.add_argument("--limit", type=int, default=100, help="Max rows to process (default 100)")
     norm_entity_parser.add_argument("--offset", type=int, default=0, help="Offset for bulk mode")
     norm_entity_parser.add_argument(
+        "--llm-provider",
+        choices=["local", "openai"],
+        default="local",
+        help="Provider for normalization LLM (default: local via Ollama)",
+    )
+    norm_entity_parser.add_argument(
+        "--ollama-model",
+        default=LOCAL_OLLAMA_MODEL,
+        help="Ollama model name for local normalization (default from OLLAMA_MODEL or phi3.5)",
+    )
+    norm_entity_parser.add_argument(
+        "--force",
+        action="store_true",
+        help="Overwrite existing normalized rows for these entities",
+    )
+    norm_entity_parser.add_argument(
         "--adl-db",
         type=Path,
         default=Path("adelined_matching.db"),
@@ -3687,6 +3946,22 @@ def parse_args(argv: Optional[Sequence[str]] = None) -> argparse.Namespace:
         type=Path,
         default=Path("adelined_matching.db"),
         help="Path to Adelined SQLite database (default: adelined_matching.db)",
+    )
+    embed_entity_parser.add_argument(
+        "--embedding-provider",
+        choices=["openai", "local"],
+        default="local",
+        help="Provider for embeddings (default: local via Ollama; use openai to call OpenAI embeddings)",
+    )
+    embed_entity_parser.add_argument(
+        "--openai",
+        action="store_true",
+        help="Shortcut to set --embedding-provider openai",
+    )
+    embed_entity_parser.add_argument(
+        "--embedding-model",
+        default=LOCAL_OLLAMA_MODEL,
+        help="Embedding model name (for local default uses OLLAMA_MODEL or phi3.5; for openai defaults to text-embedding-3-large)",
     )
 
     export_parser = subparsers.add_parser("export", help="Export a stored embedding text block to a file")
