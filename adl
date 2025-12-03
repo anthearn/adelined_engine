@@ -3348,6 +3348,44 @@ def embed_entity(args: argparse.Namespace) -> int:
             return 1
         if not embedding_model or embedding_model == LOCAL_OLLAMA_MODEL:
             embedding_model = "text-embedding-3-large"
+    # delete-only operations
+    if getattr(args, "deleteall", False):
+        confirm = input(f"Type YES to delete ALL embeddings for {entity_type}s: ").strip()
+        if confirm != "YES":
+            print("Aborted.")
+            conn.close()
+            return 1
+        cur = conn.execute(
+            "DELETE FROM entity_embeddings WHERE entity_type=?",
+            (entity_type,),
+        )
+        conn.commit()
+        print(f"🗑️ Deleted all embeddings for {entity_type}s.")
+        conn.close()
+        return 0
+    if getattr(args, "delete", False):
+        if args.id:
+            cur = conn.execute(
+                "DELETE FROM entity_embeddings WHERE entity_type=? AND entity_id=?",
+                (entity_type, args.id),
+            )
+            conn.commit()
+            print(f"🗑️ Deleted embeddings for {entity_type} id={args.id}.")
+            conn.close()
+            return 0
+        if getattr(args, "id_range", None):
+            start_id, end_id = args.id_range
+            cur = conn.execute(
+                "DELETE FROM entity_embeddings WHERE entity_type=? AND entity_id BETWEEN ? AND ?",
+                (entity_type, start_id, end_id),
+            )
+            conn.commit()
+            print(f"🗑️ Deleted embeddings for {entity_type} ids {start_id}..{end_id}.")
+            conn.close()
+            return 0
+        print("❌ --delete requires --id or --id-range", file=sys.stderr)
+        conn.close()
+        return 1
     # Optional bulk delete for this entity type
     if getattr(args, "refreshall", False):
         confirm = input(f"Type YES to delete all embeddings for {entity_type}s: ").strip()
@@ -3934,12 +3972,29 @@ def parse_args(argv: Optional[Sequence[str]] = None) -> argparse.Namespace:
         help="Which entity type to embed",
     )
     embed_entity_parser.add_argument("--id", type=int, help="Specific id (adlid for brand, podcastindex_id for creator)")
+    embed_entity_parser.add_argument(
+        "--id-range",
+        nargs=2,
+        type=int,
+        metavar=("START_ID", "END_ID"),
+        help="Contiguous id range (inclusive) for delete operations",
+    )
     embed_entity_parser.add_argument("--limit", type=int, default=100, help="Max rows to embed (default 100)")
     embed_entity_parser.add_argument("--offset", type=int, default=0, help="Offset for bulk mode")
     embed_entity_parser.add_argument(
         "--refreshall",
         action="store_true",
         help="Delete existing embeddings for this entity type before embedding (requires typing YES)",
+    )
+    embed_entity_parser.add_argument(
+        "--delete",
+        action="store_true",
+        help="Delete embeddings for --id or --id-range instead of embedding",
+    )
+    embed_entity_parser.add_argument(
+        "--deleteall",
+        action="store_true",
+        help="Delete ALL embeddings for this entity type (requires typing YES)",
     )
     embed_entity_parser.add_argument(
         "--adl-db",
