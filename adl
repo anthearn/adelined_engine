@@ -31,8 +31,95 @@ load_dotenv()
 OPENAI_CONFIRMED = False
 
 LOCAL_OLLAMA_MODEL = os.getenv("OLLAMA_MODEL", "phi3.5")
+LOCAL_OLLAMA_EMBED_MODEL = os.getenv("OLLAMA_EMBED_MODEL", "bge-large:335m-en-v1.5-fp16")
 OLLAMA_HOST = os.getenv("OLLAMA_HOST", "http://localhost:11434")
 
+APPLE_TOPICS = [
+    {"apple_id": "1301", "parent": None, "name": "Arts"},
+    {"apple_id": "1302", "parent": None, "name": "Business"},
+    {"apple_id": "1303", "parent": None, "name": "Comedy"},
+    {"apple_id": "1304", "parent": None, "name": "Education"},
+    {"apple_id": "1483", "parent": None, "name": "Fiction"},
+    {"apple_id": "1511", "parent": None, "name": "Government"},
+    {"apple_id": "1487", "parent": None, "name": "History"},
+    {"apple_id": "1512", "parent": None, "name": "Health & Fitness"},
+    {"apple_id": "1305", "parent": None, "name": "Kids & Family"},
+    {"apple_id": "1502", "parent": None, "name": "Leisure"},
+    {"apple_id": "1310", "parent": None, "name": "Music"},
+    {"apple_id": "1489", "parent": None, "name": "News"},
+    {"apple_id": "1314", "parent": None, "name": "Religion & Spirituality"},
+    {"apple_id": "1315", "parent": None, "name": "Science"},
+    {"apple_id": "1324", "parent": None, "name": "Society & Culture"},
+    {"apple_id": "1545", "parent": None, "name": "Sports"},
+    {"apple_id": "1318", "parent": None, "name": "Technology"},
+    {"apple_id": "1488", "parent": None, "name": "True Crime"},
+    {"apple_id": "1309", "parent": None, "name": "TV & Film"},
+    # Subcategories (partial but high-value)
+    {"apple_id": "1401", "parent": "1301", "name": "Design"},
+    {"apple_id": "1402", "parent": "1301", "name": "Fashion & Beauty"},
+    {"apple_id": "1404", "parent": "1301", "name": "Food"},
+    {"apple_id": "1405", "parent": "1301", "name": "Books"},
+    {"apple_id": "1412", "parent": "1301", "name": "Performing Arts"},
+    {"apple_id": "1410", "parent": "1301", "name": "Visual Arts"},
+    {"apple_id": "1413", "parent": "1302", "name": "Careers"},
+    {"apple_id": "1414", "parent": "1302", "name": "Entrepreneurship"},
+    {"apple_id": "1415", "parent": "1302", "name": "Investing"},
+    {"apple_id": "1416", "parent": "1302", "name": "Management"},
+    {"apple_id": "1471", "parent": "1302", "name": "Marketing"},
+    {"apple_id": "1472", "parent": "1302", "name": "Non-Profit"},
+    {"apple_id": "1476", "parent": "1304", "name": "Courses"},
+    {"apple_id": "1480", "parent": "1304", "name": "Self-Improvement"},
+    {"apple_id": "1468", "parent": "1304", "name": "Language Learning"},
+    {"apple_id": "1469", "parent": "1304", "name": "How To"},
+    {"apple_id": "1481", "parent": "1304", "name": "K-12"},
+    {"apple_id": "1482", "parent": "1304", "name": "Higher Education"},
+    {"apple_id": "1436", "parent": "1512", "name": "Mental Health"},
+    {"apple_id": "1438", "parent": "1512", "name": "Nutrition"},
+    {"apple_id": "1441", "parent": "1512", "name": "Fitness"},
+    {"apple_id": "1440", "parent": "1512", "name": "Sexuality"},
+    {"apple_id": "1444", "parent": "1512", "name": "Alternative Health"},
+    {"apple_id": "1459", "parent": "1502", "name": "Animation & Manga"},
+    {"apple_id": "1456", "parent": "1502", "name": "Hobbies"},
+    {"apple_id": "1463", "parent": "1502", "name": "Home & Garden"},
+    {"apple_id": "1464", "parent": "1502", "name": "Video Games"},
+    {"apple_id": "1460", "parent": "1502", "name": "Automotive"},
+    {"apple_id": "1458", "parent": "1502", "name": "Crafts"},
+    {"apple_id": "1465", "parent": "1314", "name": "Buddhism"},
+    {"apple_id": "1466", "parent": "1314", "name": "Christianity"},
+    {"apple_id": "1467", "parent": "1314", "name": "Islam"},
+    {"apple_id": "1470", "parent": "1314", "name": "Judaism"},
+    {"apple_id": "1473", "parent": "1314", "name": "Spirituality"},
+    {"apple_id": "1474", "parent": "1314", "name": "Hinduism"},
+    {"apple_id": "1475", "parent": "1314", "name": "Religion"},
+    {"apple_id": "1533", "parent": "1314", "name": "Other"},
+    {"apple_id": "1477", "parent": "1315", "name": "Natural Sciences"},
+    {"apple_id": "1478", "parent": "1315", "name": "Social Sciences"},
+    {"apple_id": "1479", "parent": "1315", "name": "Mathematics"},
+    {"apple_id": "1484", "parent": "1324", "name": "Documentary"},
+    {"apple_id": "1485", "parent": "1324", "name": "Personal Journals"},
+    {"apple_id": "1486", "parent": "1324", "name": "Philosophy"},
+    {"apple_id": "1325", "parent": "1324", "name": "Places & Travel"},
+    {"apple_id": "1547", "parent": "1545", "name": "Football"},
+    {"apple_id": "1548", "parent": "1545", "name": "Basketball"},
+    {"apple_id": "1549", "parent": "1545", "name": "Baseball"},
+    {"apple_id": "1550", "parent": "1545", "name": "Hockey"},
+    {"apple_id": "1551", "parent": "1545", "name": "Soccer"},
+    {"apple_id": "1552", "parent": "1545", "name": "Outdoor"},
+    {"apple_id": "1553", "parent": "1545", "name": "Rugby"},
+    {"apple_id": "1554", "parent": "1545", "name": "Cricket"},
+    {"apple_id": "1555", "parent": "1545", "name": "Swimming"},
+    {"apple_id": "1556", "parent": "1545", "name": "Tennis"},
+    {"apple_id": "1557", "parent": "1545", "name": "Wrestling"},
+    {"apple_id": "1558", "parent": "1545", "name": "Sports News"},
+    {"apple_id": "1559", "parent": "1545", "name": "Fantasy Sports"},
+    {"apple_id": "1560", "parent": "1545", "name": "Running"},
+    {"apple_id": "1561", "parent": "1545", "name": "Golf"},
+    {"apple_id": "1562", "parent": "1545", "name": "Volleyball"},
+    {"apple_id": "1563", "parent": "1545", "name": "Extreme Sports"},
+    {"apple_id": "1564", "parent": "1545", "name": "Swimming & Diving"},
+    {"apple_id": "1565", "parent": "1545", "name": "Racing"},
+    {"apple_id": "1566", "parent": "1545", "name": "Chess"},
+]
 PODCASTINDEX_COLUMNS: Sequence[str] = [
     "id",
     "url",
@@ -666,6 +753,21 @@ def ensure_apple_categories_table(conn: sqlite3.Connection) -> None:
     )
     conn.execute(
         "CREATE INDEX IF NOT EXISTS idx_apple_cat_parent ON apple_podcast_categories(parent_apple_id)"
+    )
+
+def ensure_creator_topics_table(conn: sqlite3.Connection) -> None:
+    conn.execute(
+        """
+        CREATE TABLE IF NOT EXISTS creator_topics (
+            podcastindex_id INTEGER,
+            apple_category_id TEXT,
+            created_at DATETIME DEFAULT CURRENT_TIMESTAMP,
+            PRIMARY KEY(podcastindex_id, apple_category_id)
+        )
+        """
+    )
+    conn.execute(
+        "CREATE INDEX IF NOT EXISTS idx_creator_topics_pid ON creator_topics(podcastindex_id)"
     )
 
 
@@ -2575,6 +2677,231 @@ def normalize_entity_to_json(
     return parsed
 
 
+def load_static(args: argparse.Namespace) -> int:
+    db_path = Path(args.adl_db)
+    if not db_path.exists():
+        print(f"❌ DB not found: {db_path}", file=sys.stderr)
+        return 1
+    conn = sqlite3.connect(db_path, timeout=10)
+    conn.row_factory = sqlite3.Row
+    configure_sqlite(conn)
+    ensure_apple_categories_table(conn)
+    if getattr(args, "apple_topics", False):
+        inserted = 0
+        for topic in APPLE_TOPICS:
+            full_path = topic["name"]
+            if topic["parent"]:
+                parent_name = next((t["name"] for t in APPLE_TOPICS if t["apple_id"] == topic["parent"]), "")
+                full_path = f"{parent_name} > {topic['name']}" if parent_name else topic["name"]
+            conn.execute(
+                """
+                INSERT OR REPLACE INTO apple_podcast_categories (apple_id, parent_apple_id, name, full_path)
+                VALUES (?, ?, ?, ?)
+                """,
+                (topic["apple_id"], topic["parent"], topic["name"], full_path),
+            )
+            inserted += 1
+        conn.commit()
+        print(f"✅ Loaded {inserted} Apple podcast categories.")
+    else:
+        print("Nothing to load.")
+    conn.close()
+    return 0
+
+
+def assign_creator_topics(args: argparse.Namespace) -> int:
+    db_path = Path(args.adl_db)
+    if not db_path.exists():
+        print(f"❌ DB not found: {db_path}", file=sys.stderr)
+        return 1
+    conn = sqlite3.connect(db_path, timeout=10)
+    conn.row_factory = sqlite3.Row
+    configure_sqlite(conn)
+    ensure_creators_table(conn)
+    ensure_podcastindex_tables(conn)
+    ensure_apple_categories_table(conn)
+    ensure_creator_topics_table(conn)
+    cat_rows = conn.execute("SELECT apple_id, parent_apple_id, name, full_path FROM apple_podcast_categories").fetchall()
+    if not cat_rows:
+        print("❌ apple_podcast_categories is empty. Run: python3 adl static load --apple-topics", file=sys.stderr)
+        conn.close()
+        return 1
+    cat_names = [r["full_path"] for r in cat_rows]
+    cat_map = {r["name"].lower(): r["apple_id"] for r in cat_rows}
+    for r in cat_rows:
+        cat_map[r["full_path"].lower()] = r["apple_id"]
+
+    use_openai = getattr(args, "openai", False)
+    if use_openai:
+        if not ensure_openai_confirmation("creator topic assignment", allow_fallback=False):
+            conn.close()
+            return 1
+    else:
+        if not ensure_ollama_running():
+            conn.close()
+            return 1
+    model = getattr(args, "ollama_model", LOCAL_OLLAMA_MODEL)
+
+    creators = []
+    total_candidates = 0
+    if getattr(args, "nolimit", False):
+        resp = input("Type YES to process ALL creators without limit: ").strip()
+        if resp != "YES":
+            print("Aborted.")
+            conn.close()
+            return 1
+        total_candidates = conn.execute(
+            """
+            SELECT COUNT(*) FROM creators c
+            WHERE NOT EXISTS (SELECT 1 FROM creator_topics ct WHERE ct.podcastindex_id = c.podcastindex_id)
+            """
+        ).fetchone()[0]
+        creators = conn.execute(
+            """
+            SELECT c.podcastindex_id, c.title, c.description,
+                   pf.title as feed_title, pf.description as feed_description,
+                   pf.category1, pf.category2, pf.category3, pf.category4, pf.category5
+            FROM creators c
+            LEFT JOIN podcastindex_feeds pf ON pf.id = c.podcastindex_id
+            WHERE NOT EXISTS (
+                SELECT 1 FROM creator_topics ct WHERE ct.podcastindex_id = c.podcastindex_id
+            )
+            """
+        ).fetchall()
+    else:
+        total_candidates = conn.execute(
+            """
+            SELECT COUNT(*) FROM creators c
+            WHERE NOT EXISTS (SELECT 1 FROM creator_topics ct WHERE ct.podcastindex_id = c.podcastindex_id)
+            """
+        ).fetchone()[0]
+        creators = conn.execute(
+            """
+            SELECT c.podcastindex_id, c.title, c.description,
+                   pf.title as feed_title, pf.description as feed_description,
+                   pf.category1, pf.category2, pf.category3, pf.category4, pf.category5
+            FROM creators c
+            LEFT JOIN podcastindex_feeds pf ON pf.id = c.podcastindex_id
+            WHERE NOT EXISTS (
+                SELECT 1 FROM creator_topics ct WHERE ct.podcastindex_id = c.podcastindex_id
+            )
+            LIMIT ? OFFSET ?
+            """,
+            (args.limit, args.offset),
+        ).fetchall()
+    if not creators:
+        print("No creators found for topic assignment.")
+        conn.close()
+        return 0
+
+    def llm_topics(payload: str) -> List[str]:
+        prompt = (
+            "You are mapping a podcast to Apple Podcast categories. Pick 1-3 categories from the list that best match the show.\n"
+            "Return JSON ONLY: {\"categories\": [\"<category name>\"]}. Use names exactly from the list provided.\n"
+            f"AVAILABLE CATEGORIES:\n" + "\n".join(cat_names) + "\n\n"
+            f"SHOW INFO:\n{payload}\n"
+        )
+        if use_openai:
+            client = OpenAI(api_key=os.getenv("OPENAI_API_KEY"))
+            try:
+                resp = client.chat.completions.create(
+                    model="gpt-4o-mini",
+                    messages=[{"role": "user", "content": prompt}],
+                    temperature=0.1,
+                    response_format={"type": "json_object"},
+                )
+                data = json.loads(resp.choices[0].message.content)
+                return data.get("categories") or []
+            except Exception as exc:
+                print(f"⚠️ Topic LLM failed (openai): {exc}", file=sys.stderr)
+                return []
+        # local via ollama
+        try:
+            res = requests.post(
+                f"{OLLAMA_HOST}/api/generate",
+                json={"model": model, "prompt": prompt, "format": "json", "options": {"num_predict": 256}},
+                timeout=120,
+            )
+            res.raise_for_status()
+            # accumulate streamed response
+            chunks = []
+            for line in res.iter_lines():
+                if not line:
+                    continue
+                try:
+                    obj = json.loads(line.decode("utf-8"))
+                    if "response" in obj:
+                        chunks.append(obj["response"])
+                except Exception:
+                    continue
+            text = "".join(chunks).strip()
+            for fence in ("```json", "```", "`"):
+                text = text.replace(fence, "")
+            try:
+                data = json.loads(text)
+                return data.get("categories") or []
+            except Exception:
+                # try brace substring
+                start = text.find("{")
+                end = text.rfind("}")
+                if start != -1 and end != -1 and end > start:
+                    try:
+                        data = json.loads(text[start : end + 1])
+                        return data.get("categories") or []
+                    except Exception:
+                        return []
+            return []
+        except Exception as exc:
+            print(f"⚠️ Topic LLM failed (ollama): {exc}", file=sys.stderr)
+            return []
+
+    inserted = 0
+    total = len(creators)
+    if total:
+        print(f"Assigning topics for {total} creators (eligible: {total_candidates})...")
+    for idx, c in enumerate(creators, 1):
+        payload_parts = [
+            f"TITLE: {c['title'] or ''}",
+            f"DESCRIPTION: {c['description'] or ''}",
+            f"FEED_TITLE: {c['feed_title'] or ''}",
+            f"FEED_DESCRIPTION: {c['feed_description'] or ''}",
+            "CATEGORIES: " + ", ".join([c[f"category{i}"] or "" for i in range(1, 6)]),
+        ]
+        topics = llm_topics("\n".join(payload_parts))
+        mapped_ids = []
+        for t in topics:
+            key = str(t).lower().strip()
+            if key in cat_map:
+                mapped_ids.append(cat_map[key])
+        if not mapped_ids and topics:
+            # try partial matches
+            for t in topics:
+                key = str(t).lower().strip()
+                for name, apple_id in cat_map.items():
+                    if key in name:
+                        mapped_ids.append(apple_id)
+                        break
+        mapped_ids = mapped_ids[:3]
+        if mapped_ids:
+            conn.execute(
+                "DELETE FROM creator_topics WHERE podcastindex_id=?",
+                (c["podcastindex_id"],),
+            )
+            for cat_id in mapped_ids:
+                conn.execute(
+                    "INSERT OR IGNORE INTO creator_topics (podcastindex_id, apple_category_id) VALUES (?, ?)",
+                    (c["podcastindex_id"], cat_id),
+                )
+            inserted += 1
+        if idx % 5 == 0 or idx == total:
+            print(f"Topics progress: {idx}/{total} creators... inserted {inserted}", end="\r")
+    conn.commit()
+    print(f"\n✅ Assigned topics for {inserted}/{total} creators.")
+    conn.close()
+    return 0
+
+
+
 def build_brand_text_block(row: sqlite3.Row) -> str:
     def clip(val: Optional[str], max_len: int = 800) -> str:
         if not val:
@@ -3341,13 +3668,14 @@ def embed_entity(args: argparse.Namespace) -> int:
     ]
     entity_type = args.entity_type
     embedding_provider = "openai" if getattr(args, "openai", False) else getattr(args, "embedding_provider", "local")
-    embedding_model = getattr(args, "embedding_model", LOCAL_OLLAMA_MODEL)
+    if embedding_provider == "openai":
+        embedding_model = "text-embedding-3-large"
+    else:
+        embedding_model = getattr(args, "embedding_model", LOCAL_OLLAMA_EMBED_MODEL)
     if embedding_provider == "openai":
         if not ensure_openai_confirmation("embeddings", allow_fallback=False):
             conn.close()
             return 1
-        if not embedding_model or embedding_model == LOCAL_OLLAMA_MODEL:
-            embedding_model = "text-embedding-3-large"
     # delete-only operations
     if getattr(args, "deleteall", False):
         confirm = input(f"Type YES to delete ALL embeddings for {entity_type}s: ").strip()
@@ -3425,8 +3753,10 @@ def embed_entity(args: argparse.Namespace) -> int:
         print("No normalized records to embed.")
         conn.close()
         return 0
-    model_name = "text-embedding-3-large"
+    model_name = embedding_model
+    print(f"Embedding {len(rows)} {entity_type}(s) using provider={embedding_provider}, model={model_name}")
     inserted = 0
+    total = len(rows)
     for r in rows:
         ent_id = r["podcastindex_id"] if entity_type == "creator" else r["adlid"]
         conn.execute(
@@ -3449,8 +3779,10 @@ def embed_entity(args: argparse.Namespace) -> int:
                 (entity_type, ent_id, vt, json.dumps(vec), confidence, text[:4000], r["norm_id"], model_name),
             )
             inserted += 1
+        if inserted % 5 == 0 or inserted == total * len(vector_types):
+            print(f"Embedding progress: {inserted} vectors for {total} {entity_type}(s)...", end="\r")
     conn.commit()
-    print(f"✅ Embedded {inserted} vectors for {len(rows)} {entity_type}(s).")
+    print(f"\n✅ Embedded {inserted} vectors for {len(rows)} {entity_type}(s).")
     conn.close()
     return 0
 
@@ -3628,6 +3960,24 @@ def rank_entities(args: argparse.Namespace) -> int:
         denom = sum(w for vt, w in weights.items() if vt in sims)
         return (num / denom if denom else 0.0), sims
 
+    def warn_normalization(row: sqlite3.Row) -> List[str]:
+        warnings = []
+        if not (row["normalized_vertical"] or "").strip():
+            warnings.append("vertical missing")
+        if not (row["normalized_audience"] or "").strip():
+            warnings.append("audience missing")
+        if not (row["normalized_summary"] or "").strip():
+            warnings.append("summary missing")
+        return warnings
+
+    def warn_sims(sims: Dict[str, float]) -> List[str]:
+        warnings = []
+        if sims.get("topics", 0) > 0.9 and sims.get("vertical", 0) < 0.2 and sims.get("audience", 0) < 0.2:
+            warnings.append("topics dominating")
+        if sims.get("tone", 0) > 0.9 and sims.get("vertical", 0) < 0.2 and sims.get("audience", 0) < 0.2:
+            warnings.append("tone dominating")
+        return warnings
+
     if args.bybrand:
         brand = conn.execute("SELECT adlid, brand_name FROM brands WHERE adlid = ?", (adlid,)).fetchone()
         if not brand:
@@ -3639,13 +3989,17 @@ def rank_entities(args: argparse.Namespace) -> int:
             return 1
         creator_rows = conn.execute(
             """
-            SELECT c.podcastindex_id, COALESCE(c.title, pf.title, '') AS name
+            SELECT c.podcastindex_id, COALESCE(c.title, pf.title, '') AS name,
+                   c.normalized_vertical, c.normalized_audience, c.normalized_pain_points,
+                   c.normalized_use_cases, c.normalized_themes, c.normalized_tone,
+                   c.normalized_geo, c.normalized_topics, c.normalized_summary
             FROM creators c
             LEFT JOIN podcastindex_feeds pf ON pf.id = c.podcastindex_id
             WHERE EXISTS (SELECT 1 FROM entity_embeddings ee WHERE ee.entity_type='creator' AND ee.entity_id=c.podcastindex_id)
             """
         ).fetchall()
         scored = []
+        debug_rows = []
         for r in creator_rows:
             cmap = load_embeddings_map(conn, "creator", r["podcastindex_id"])
             if not cmap:
@@ -3653,12 +4007,80 @@ def rank_entities(args: argparse.Namespace) -> int:
             final_score, sims = score_pair(bmap, cmap)
             top_dims = sorted(sims.items(), key=lambda x: x[1], reverse=True)[:2]
             notes = "; ".join([f"{d}:{v:.2f}" for d, v in top_dims])
+            warn_list = warn_normalization(r) + warn_sims(sims)
+            if warn_list:
+                notes = notes + ("; " if notes else "") + " | ".join(warn_list)
             scored.append((r["podcastindex_id"], r["name"] or "", final_score, relevance_label(final_score), notes))
+            debug_rows.append(
+                {
+                    "id": r["podcastindex_id"],
+                    "name": r["name"] or "",
+                    "sims": sims,
+                    "norm": {
+                        "vertical": r["normalized_vertical"],
+                        "audience": r["normalized_audience"],
+                        "pain_points": r["normalized_pain_points"],
+                        "use_cases": r["normalized_use_cases"],
+                        "themes": r["normalized_themes"],
+                        "tone": r["normalized_tone"],
+                        "geo": r["normalized_geo"],
+                        "topics": r["normalized_topics"],
+                        "summary": r["normalized_summary"],
+                    },
+                    "notes": notes,
+                }
+            )
         scored.sort(key=lambda x: x[2], reverse=True)
         rows = scored[:limit]
         print(f"Ranking by Brand: adlid={adlid}, brand=\"{brand['brand_name'] or ''}\"")
-        table = format_table(rows, ("id", "podcast_title", "score", "relevance", "top_dims"))
-        print(table)
+        if args.debug:
+            def fmt(val):
+                return f"{val:.2f}" if val is not None else ""
+            header = ("id", "title", "score", "relevance", "summary", "audience", "vertical", "topics", "pain", "tone", "geo")
+            dbg_rows = []
+            for row in rows:
+                dbg = next((d for d in debug_rows if d["id"] == row[0]), None)
+                sims = dbg["sims"] if dbg else {}
+                dbg_rows.append(
+                    (
+                        row[0],
+                        row[1],
+                        f"{row[2]:.3f}",
+                        row[3],
+                        fmt(sims.get("semantic_summary")),
+                        fmt(sims.get("audience")),
+                        fmt(sims.get("vertical")),
+                        fmt(sims.get("topics")),
+                        fmt(sims.get("pain_points")),
+                        fmt(sims.get("tone")),
+                        fmt(sims.get("geo")),
+                    )
+                )
+            print(format_table(dbg_rows, header))
+        else:
+            table = format_table(rows, ("id", "podcast_title", "score", "relevance", "top_dims"))
+            print(table)
+        if args.raw:
+            out_dir = Path("tests")
+            out_dir.mkdir(parents=True, exist_ok=True)
+            guid = datetime.utcnow().strftime("%Y%m%d%H%M%S%f")
+            out_path = out_dir / f"rank-debug-brand{adlid}-{guid}.txt"
+            with out_path.open("w") as f:
+                f.write(f"Ranking by Brand: adlid={adlid}, brand=\"{brand['brand_name'] or ''}\"\n")
+                for row in rows:
+                    dbg = next((d for d in debug_rows if d["id"] == row[0]), None)
+                    if not dbg:
+                        continue
+                    f.write(f"\nCreator {row[0]} | {row[1]}\n")
+                    norm = dbg["norm"]
+                    for k in ["vertical", "audience", "pain_points", "use_cases", "themes", "tone", "geo", "topics", "summary"]:
+                        f.write(f"{k.upper()}: {norm.get(k) or ''}\n")
+                    f.write("SIMS:\n")
+                    for vt, val in sorted(dbg["sims"].items()):
+                        f.write(f"  {vt}: {val:.3f}\n")
+                    if dbg["notes"]:
+                        f.write(f"NOTES: {dbg['notes']}\n")
+            print(f"📝 Raw debug written to {out_path}")
         if getattr(args, "csv", False):
             out_name = f"{datetime.utcnow():%Y%m%d}-brand{adlid}.csv"
             with open(out_name, "w", newline="") as f:
@@ -3672,7 +4094,7 @@ def rank_entities(args: argparse.Namespace) -> int:
 
     if args.bycreator:
         creator = conn.execute(
-            "SELECT c.podcastindex_id, c.title AS name FROM creators c WHERE c.podcastindex_id = ?",
+            "SELECT c.podcastindex_id, COALESCE(c.title, pf.title, '') AS name, c.normalized_vertical, c.normalized_audience, c.normalized_pain_points, c.normalized_use_cases, c.normalized_themes, c.normalized_tone, c.normalized_geo, c.normalized_topics, c.normalized_summary FROM creators c LEFT JOIN podcastindex_feeds pf ON pf.id=c.podcastindex_id WHERE c.podcastindex_id = ?",
             (adlid,),
         ).fetchone()
         if not creator:
@@ -3684,12 +4106,16 @@ def rank_entities(args: argparse.Namespace) -> int:
             return 1
         brand_rows = conn.execute(
             """
-            SELECT b.adlid, COALESCE(b.brand_name, '') AS brand_name
+            SELECT b.adlid, COALESCE(b.brand_name, '') AS brand_name,
+                   b.normalized_vertical, b.normalized_audience, b.normalized_pain_points,
+                   b.normalized_use_cases, b.normalized_themes, b.normalized_tone,
+                   b.normalized_geo, b.normalized_topics, b.normalized_summary
             FROM brands b
             WHERE EXISTS (SELECT 1 FROM entity_embeddings ee WHERE ee.entity_type='brand' AND ee.entity_id=b.adlid)
             """
         ).fetchall()
         scored = []
+        debug_rows = []
         for r in brand_rows:
             bmap = load_embeddings_map(conn, "brand", r["adlid"])
             if not bmap:
@@ -3697,12 +4123,80 @@ def rank_entities(args: argparse.Namespace) -> int:
             final_score, sims = score_pair(bmap, cmap)
             top_dims = sorted(sims.items(), key=lambda x: x[1], reverse=True)[:2]
             notes = "; ".join([f"{d}:{v:.2f}" for d, v in top_dims])
+            warn_list = warn_normalization(r) + warn_sims(sims)
+            if warn_list:
+                notes = notes + ("; " if notes else "") + " | ".join(warn_list)
             scored.append((r["adlid"], r["brand_name"] or "", final_score, relevance_label(final_score), notes))
+            debug_rows.append(
+                {
+                    "id": r["adlid"],
+                    "name": r["brand_name"] or "",
+                    "sims": sims,
+                    "norm": {
+                        "vertical": r["normalized_vertical"],
+                        "audience": r["normalized_audience"],
+                        "pain_points": r["normalized_pain_points"],
+                        "use_cases": r["normalized_use_cases"],
+                        "themes": r["normalized_themes"],
+                        "tone": r["normalized_tone"],
+                        "geo": r["normalized_geo"],
+                        "topics": r["normalized_topics"],
+                        "summary": r["normalized_summary"],
+                    },
+                    "notes": notes,
+                }
+            )
         scored.sort(key=lambda x: x[2], reverse=True)
         rows = scored[:limit]
         print(f"Ranking by Creator: adlid={adlid}, podcast=\"{creator['name'] or ''}\"")
-        table = format_table(rows, ("id", "brand_name", "score", "relevance", "notes"))
-        print(table)
+        if args.debug:
+            def fmt(val):
+                return f"{val:.2f}" if val is not None else ""
+            header = ("id", "brand_name", "score", "relevance", "summary", "audience", "vertical", "topics", "pain", "tone", "geo")
+            dbg_rows = []
+            for row in rows:
+                dbg = next((d for d in debug_rows if d["id"] == row[0]), None)
+                sims = dbg["sims"] if dbg else {}
+                dbg_rows.append(
+                    (
+                        row[0],
+                        row[1],
+                        f"{row[2]:.3f}",
+                        row[3],
+                        fmt(sims.get("semantic_summary")),
+                        fmt(sims.get("audience")),
+                        fmt(sims.get("vertical")),
+                        fmt(sims.get("topics")),
+                        fmt(sims.get("pain_points")),
+                        fmt(sims.get("tone")),
+                        fmt(sims.get("geo")),
+                    )
+                )
+            print(format_table(dbg_rows, header))
+        else:
+            table = format_table(rows, ("id", "brand_name", "score", "relevance", "notes"))
+            print(table)
+        if args.raw:
+            out_dir = Path("tests")
+            out_dir.mkdir(parents=True, exist_ok=True)
+            guid = datetime.utcnow().strftime("%Y%m%d%H%M%S%f")
+            out_path = out_dir / f"rank-debug-creator{adlid}-{guid}.txt"
+            with out_path.open("w") as f:
+                f.write(f"Ranking by Creator: adlid={adlid}, podcast=\"{creator['name'] or ''}\"\n")
+                for row in rows:
+                    dbg = next((d for d in debug_rows if d["id"] == row[0]), None)
+                    if not dbg:
+                        continue
+                    f.write(f"\nBrand {row[0]} | {row[1]}\n")
+                    norm = dbg["norm"]
+                    for k in ["vertical", "audience", "pain_points", "use_cases", "themes", "tone", "geo", "topics", "summary"]:
+                        f.write(f"{k.upper()}: {norm.get(k) or ''}\n")
+                    f.write("SIMS:\n")
+                    for vt, val in sorted(dbg["sims"].items()):
+                        f.write(f"  {vt}: {val:.3f}\n")
+                    if dbg["notes"]:
+                        f.write(f"NOTES: {dbg['notes']}\n")
+            print(f"📝 Raw debug written to {out_path}")
         if getattr(args, "csv", False):
             out_name = f"{datetime.utcnow():%Y%m%d}-creator{adlid}.csv"
             with open(out_name, "w", newline="") as f:
@@ -3900,6 +4394,46 @@ def parse_args(argv: Optional[Sequence[str]] = None) -> argparse.Namespace:
         help="Path to Adelined SQLite database (default: adelined_matching.db)",
     )
 
+    static_parser = subparsers.add_parser("static", help="Load static reference data")
+    static_sub = static_parser.add_subparsers(dest="static_action", required=True)
+    load_parser = static_sub.add_parser("load", help="Load static data sets")
+    load_parser.add_argument(
+        "--apple-topics",
+        action="store_true",
+        help="Load Apple podcast categories into apple_podcast_categories table",
+    )
+    load_parser.add_argument(
+        "--adl-db",
+        type=Path,
+        default=Path("adelined_matching.db"),
+        help="Path to Adelined SQLite database (default: adelined_matching.db)",
+    )
+
+    topics_parser = static_sub.add_parser("creator-topics", help="Assign Apple topics to creators using local LLM")
+    topics_parser.add_argument(
+        "--adl-db",
+        type=Path,
+        default=Path("adelined_matching.db"),
+        help="Path to Adelined SQLite database (default: adelined_matching.db)",
+    )
+    topics_parser.add_argument("--limit", type=int, default=200, help="Max creators to process")
+    topics_parser.add_argument("--offset", type=int, default=0, help="Offset into creators table")
+    topics_parser.add_argument(
+        "--openai",
+        action="store_true",
+        help="Use OpenAI instead of local (default local Ollama)",
+    )
+    topics_parser.add_argument(
+        "--ollama-model",
+        default=LOCAL_OLLAMA_MODEL,
+        help="Ollama model name for topic assignment (default from OLLAMA_MODEL or phi3.5)",
+    )
+    topics_parser.add_argument(
+        "--nolimit",
+        action="store_true",
+        help="Process all creators (ignore limit/offset) — requires confirmation",
+    )
+
     brand_parser = subparsers.add_parser("brand", help="Ingest a brand by URL")
     brand_parser.add_argument(
         "--url",
@@ -4015,8 +4549,8 @@ def parse_args(argv: Optional[Sequence[str]] = None) -> argparse.Namespace:
     )
     embed_entity_parser.add_argument(
         "--embedding-model",
-        default=LOCAL_OLLAMA_MODEL,
-        help="Embedding model name (for local default uses OLLAMA_MODEL or phi3.5; for openai defaults to text-embedding-3-large)",
+        default=LOCAL_OLLAMA_EMBED_MODEL,
+        help="Embedding model name (local default: bge-large:335m-en-v1.5-fp16 via OLLAMA_EMBED_MODEL; openai default: text-embedding-3-large)",
     )
 
     export_parser = subparsers.add_parser("export", help="Export a stored embedding text block to a file")
@@ -4070,6 +4604,16 @@ def parse_args(argv: Optional[Sequence[str]] = None) -> argparse.Namespace:
         type=int,
         default=20,
         help="Number of top results to show (default: 20)",
+    )
+    rank_parser.add_argument(
+        "--debug",
+        action="store_true",
+        help="Show per-dimension similarity columns and warnings",
+    )
+    rank_parser.add_argument(
+        "--raw",
+        action="store_true",
+        help="Dump normalized fields and sims for each candidate",
     )
     rank_parser.add_argument(
         "--csv",
@@ -4195,6 +4739,11 @@ def main(argv: Optional[Sequence[str]] = None) -> int:
         return normalize_entities(args)
     if args.action == "embed-entity":
         return embed_entity(args)
+    if args.action == "static":
+        if args.static_action == "load":
+            return load_static(args)
+        if args.static_action == "creator-topics":
+            return assign_creator_topics(args)
     if args.action == "rank":
         return rank_entities(args)
     if args.action == "test-compare":
@@ -4224,6 +4773,7 @@ Commands:
   python3 adl brand --url <website>
   python3 adl normalize-entity --entity-type brand|creator [--id <id> | --all-brands/--all-creators]
   python3 adl embed-entity --entity-type brand|creator [--id <id> | --limit N --offset M]
+  python3 adl static load --apple-topics
   python3 adl rank --bybrand/--bycreator --adlid <id> [options]
   python3 adl test-compare --text1/--file1 --text2/--file2
   python3 adl test-enrich --pid <podcastindex_id>

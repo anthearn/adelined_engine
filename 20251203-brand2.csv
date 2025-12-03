@@ -1,0 +1,24 @@
+id,podcast_title,score,relevance,top_dims
+221558,Déjà The View,0.9387643144703295,strong,tone:0.97; topics:0.97
+221513,Harvest Bible Church Windsor,0.9279316341045711,strong,tone:0.98; topics:0.96
+221591,The SHEA Podcast,0.923710656324226,strong,topics:0.97; semantic_summary:0.95
+221598,PreserveCast,0.922657617207304,strong,tone:0.97; topics:0.96
+221533,BRB Podcasts,0.9208376907466969,strong,pain_points:0.94; topics:0.93
+221569,Hyphenación,0.9204650505314991,strong,topics:0.95; vertical:0.95
+221554,RUF at Belmont,0.9193253690336887,strong,topics:0.95; pain_points:0.95
+221545,Social Capital,0.9189557498806045,strong,topics:0.98; semantic_summary:0.94
+221565,Aspire Church Manchester UK  - Sermons,0.9155307124530977,strong,topics:0.96; tone:0.94
+221564,Mike and Tim Visit Earth,0.9153234604022223,strong,topics:0.96; pain_points:0.94
+221542,"Restore Church Audio | Yorkville, IL",0.9150484994555845,strong,pain_points:0.94; vertical:0.94
+221522,Thomas Aquinas College Lectures & Talks,0.9146186417446983,strong,topics:0.97; pain_points:0.95
+221526,Ratchet+Wrench Radio,0.9138743163029783,strong,topics:0.97; semantic_summary:0.95
+221575,Real Estate for Breakfast,0.9134034118293537,strong,topics:0.97; vertical:0.94
+221504,This Week in the BIG EAST - Weekly Overview of NCAA College Basketball's Top Conference,0.9119397285001264,strong,tone:0.98; semantic_summary:0.94
+221514,RaboResearch Food & Agribusiness Australia/NZ,0.911852461674792,strong,topics:0.96; semantic_summary:0.95
+221566,Mayo Clinic Proceedings: Insights,0.9108502409713132,strong,topics:0.96; vertical:0.93
+221580,Safe Harbor Baptist Church,0.9101080334410214,strong,vertical:0.94; pain_points:0.93
+221584,Matthew Maran Podcast,0.9099611115807458,strong,topics:0.94; vertical:0.93
+221563,Harvest Church St. Louis,0.9043755764412456,strong,topics:0.96; semantic_summary:0.93
+221530,Upward Church,0.9035110546066589,strong,topics:0.98; tone:0.97
+221594,The Unsung Heroes,0.8998804685899316,strong,topics:0.95; pain_points:0.93
+221525,THE ECOMMERCE EDGE Podcast with Jason Greenwood,0.8904494266247499,strong,topics:0.94; pain_points:0.93
