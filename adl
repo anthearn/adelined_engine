@@ -13,6 +13,7 @@ import os
 import re
 import sqlite3
 import sys
+import threading
 import time
 from dataclasses import dataclass
 from datetime import datetime
@@ -33,6 +34,23 @@ OPENAI_CONFIRMED = False
 LOCAL_OLLAMA_MODEL = os.getenv("OLLAMA_MODEL", "phi3.5")
 LOCAL_OLLAMA_EMBED_MODEL = os.getenv("OLLAMA_EMBED_MODEL", "bge-large:335m-en-v1.5-fp16")
 OLLAMA_HOST = os.getenv("OLLAMA_HOST", "http://localhost:11434")
+LLM_PROVIDER_META_ENRICH = "LLM_PROVIDER_META_ENRICH"
+LLM_PROVIDER_EMBED = "LLM_PROVIDER_EMBED"
+PODSCAN_API_BASE = "https://podscan.fm/api/v1"
+
+
+def resolve_llm_provider(env_var: str, default: str) -> str:
+    raw = os.getenv(env_var)
+    if not raw:
+        return default
+    val = raw.strip().lower()
+    if val in ("local", "openai"):
+        return val
+    print(
+        f"⚠️ {env_var} must be 'local' or 'openai'; got '{raw}'.",
+        file=sys.stderr,
+    )
+    raise ValueError(f"Invalid {env_var} value: {raw}")
 
 APPLE_TOPICS = [
     {"apple_id": "1301", "parent": None, "name": "Arts"},
@@ -592,6 +610,18 @@ def ensure_creator_enrichment_table(conn: sqlite3.Connection) -> None:
         """
     )
     ensure_column(conn, "creator_enrichment", "normalized_text", "TEXT")
+
+
+def ensure_creator_country_table(conn: sqlite3.Connection) -> None:
+    conn.execute(
+        """
+        CREATE TABLE IF NOT EXISTS creator_country (
+            podcastindex_id INTEGER PRIMARY KEY,
+            itunesid INTEGER,
+            country TEXT
+        )
+        """
+    )
 
 
 def ensure_column(conn: sqlite3.Connection, table: str, column: str, coltype: str) -> None:
@@ -1425,11 +1455,58 @@ def fetch_apple_metadata(itunes_id: Optional[int], title: str) -> Dict:
             "artistUrl": best.get("artistViewUrl"),
             "collectionUrl": best.get("collectionViewUrl"),
             "feedUrl": best.get("feedUrl"),
+            "country": best.get("country"),
             "status": "ok",
         }
     except Exception as exc:
         print(f"⚠️ Apple lookup failed: {exc}", file=sys.stderr)
         return {}
+
+
+def fetch_podscan_country(
+    itunes_id: Optional[int],
+) -> Tuple[Optional[str], Optional[str], Optional[Dict]]:
+    if not itunes_id:
+        return None, None, None
+    key = os.getenv("PODSCAN_API_KEY")
+    if not key:
+        print("❌ PODSCAN_API_KEY not set; cannot lookup country.", file=sys.stderr)
+        return None, None, None
+    headers = {
+        "Authorization": f"Bearer {key}",
+        "Accept": "application/json",
+        "User-Agent": "adelined/1.0",
+    }
+    res = requests.get(
+        f"{PODSCAN_API_BASE}/podcasts/search/by/itunesid",
+        headers=headers,
+        params={"itunes_id": itunes_id},
+        timeout=15,
+    )
+    if res.status_code == 404:
+        return "404", None, None
+    res.raise_for_status()
+    data = res.json()
+    podcast = data.get("podcast") or {}
+    region = podcast.get("region")
+    reach = data.get("reach") or (podcast.get("reach") or {})
+    social_links = reach.get("social_links") or podcast.get("social_links") or []
+    email = reach.get("email")
+    if not email:
+        for link in social_links:
+            item = link or {}
+            link_email = item.get("email")
+            if link_email:
+                email = link_email
+                break
+            url = item.get("url") or ""
+            if url.startswith("mailto:"):
+                email = url.replace("mailto:", "", 1)
+                break
+            if item.get("platform") == "email" and url:
+                email = url
+                break
+    return (str(region).upper() if region else None), email, data
 
 
 def fetch_spotify_metadata(show_url: Optional[str], title: str) -> Dict:
@@ -2507,12 +2584,7 @@ def extract_creator_metadata(raw_text: str) -> Dict:
     """
     Use GPT to extract structured creator metadata for embeddings.
     """
-    if not ensure_openai_confirmation("creator metadata extraction", allow_fallback=False):
-        return {}
-    key = os.getenv("OPENAI_API_KEY")
-    if not key:
-        return {}
-    client = OpenAI(api_key=key)
+    provider = resolve_llm_provider(LLM_PROVIDER_META_ENRICH, "openai")
     if len(raw_text) > 15000:
         raw_text = raw_text[:15000]
     prompt = (
@@ -2529,16 +2601,31 @@ def extract_creator_metadata(raw_text: str) -> Dict:
         "Input text:\n"
         f"{raw_text}"
     )
+    if provider == "openai":
+        if not ensure_openai_confirmation("creator metadata extraction", allow_fallback=False):
+            return {}
+        key = os.getenv("OPENAI_API_KEY")
+        if not key:
+            return {}
+        client = OpenAI(api_key=key)
+        try:
+            resp = client.chat.completions.create(
+                model="gpt-4o-mini",
+                messages=[{"role": "user", "content": prompt}],
+                temperature=0.2,
+                response_format={"type": "json_object"},
+            )
+            return json.loads(resp.choices[0].message.content)
+        except Exception as exc:
+            print(f"⚠️ Creator metadata extraction failed: {exc}", file=sys.stderr)
+            return {}
+    text = ollama_generate(prompt, LOCAL_OLLAMA_MODEL)
+    if not text:
+        return {}
     try:
-        resp = client.chat.completions.create(
-            model="gpt-4o-mini",
-            messages=[{"role": "user", "content": prompt}],
-            temperature=0.2,
-            response_format={"type": "json_object"},
-        )
-        return json.loads(resp.choices[0].message.content)
+        return json.loads(text)
     except Exception as exc:
-        print(f"⚠️ Creator metadata extraction failed: {exc}", file=sys.stderr)
+        print(f"⚠️ Creator metadata extraction failed (local): {exc}", file=sys.stderr)
         return {}
 
 
@@ -3112,9 +3199,15 @@ def build_brand_text_block(row: sqlite3.Row) -> str:
     return "\n".join(parts)
 
 
-def embed_text_block(text: str, provider: str = "local", model: str = "text-embedding-3-large") -> Optional[List[float]]:
+def embed_text_block(
+    text: str,
+    provider: Optional[str] = None,
+    model: str = "text-embedding-3-large",
+) -> Optional[List[float]]:
     if not text:
         return None
+    if provider is None:
+        provider = resolve_llm_provider(LLM_PROVIDER_EMBED, "local")
     if provider == "openai":
         if not ensure_openai_confirmation("embeddings", allow_fallback=False):
             return None
@@ -3564,6 +3657,200 @@ def export_entity(args: argparse.Namespace) -> int:
         conn.close()
 
 
+def find_creator_country(args: argparse.Namespace) -> int:
+    db_path = Path(args.adl_db)
+    if not db_path.exists():
+        print(f"❌ DB not found: {db_path}", file=sys.stderr)
+        return 1
+    if not os.getenv("PODSCAN_API_KEY"):
+        print("❌ PODSCAN_API_KEY not set; cannot lookup creator country.", file=sys.stderr)
+        return 1
+
+    conn = sqlite3.connect(db_path, timeout=10)
+    conn.row_factory = sqlite3.Row
+    configure_sqlite(conn)
+    try:
+        spinner_frames = ["|", "/", "-", "\\"]
+
+        def start_spinner(label: str) -> Tuple[threading.Event, threading.Thread]:
+            stop_event = threading.Event()
+
+            def run() -> None:
+                idx = 0
+                while not stop_event.is_set():
+                    frame = spinner_frames[idx % len(spinner_frames)]
+                    sys.stdout.write(f"\r{frame} {label}")
+                    sys.stdout.flush()
+                    idx += 1
+                    time.sleep(0.1)
+
+            thread = threading.Thread(target=run, daemon=True)
+            thread.start()
+            return stop_event, thread
+
+        def sleep_with_countdown(seconds: int) -> None:
+            print(f"⏸️ Sleeping for {seconds}s to respect rate limits.")
+            for remaining in range(seconds, 0, -1):
+                sys.stdout.write(f"\r⏳ Sleeping... {remaining}s")
+                sys.stdout.flush()
+                time.sleep(1)
+            sys.stdout.write("\r▶️ Restarting requests.        \n")
+            sys.stdout.flush()
+
+        ensure_podcastindex_tables(conn)
+        ensure_creator_country_table(conn)
+
+        excluded = (
+            "religion",
+            "",
+            "government",
+            "christianity",
+            "politics",
+            "spirituality",
+            "pets",
+            "management",
+            "health",
+        )
+        params: List = []
+        if args.pid is not None:
+            print("⚠️ --pid forces print-only mode; no DB writes will occur.")
+            base_query = """
+                SELECT id AS podcastindex_id, itunesId, title
+                FROM podcastindex_feeds
+                WHERE id = ?
+                  AND NOT EXISTS (
+                      SELECT 1 FROM creator_country cc
+                      WHERE cc.podcastindex_id = podcastindex_feeds.id
+                  )
+            """
+            params.append(args.pid)
+            args.print_only = True
+        else:
+            base_query = """
+                SELECT id AS podcastindex_id, itunesId, title
+                FROM podcastindex_feeds
+                WHERE dead = 0
+                  AND CAST(itunesId AS INTEGER) > 0
+                  AND language IN ('en', 'en-us', 'en-gb')
+                  AND episodeCount >= 10
+                  AND lastUpdate >= strftime('%s','now') - (180*24*60*60)
+                  AND link IS NOT NULL AND TRIM(link) <> ''
+                  AND url  IS NOT NULL AND TRIM(url)  <> ''
+                  AND lower(category1) NOT IN ({excluded})
+                  AND NOT EXISTS (
+                      SELECT 1 FROM creator_country cc
+                      WHERE cc.podcastindex_id = podcastindex_feeds.id
+                  )
+                ORDER BY lastUpdate DESC, episodeCount DESC
+            """.format(excluded=",".join("?" for _ in excluded))
+            params.extend(list(excluded))
+            if args.limit != 0:
+                base_query += " LIMIT ?"
+                params.append(args.limit)
+
+        rows = conn.execute(base_query, params).fetchall()
+        if not rows:
+            print("No creators matched the filter.")
+            return 0
+
+        inserted = 0
+        missing = 0
+        missing_itunes = 0
+        missing_country = 0
+        not_found_404 = 0
+        podscan_hits = 0
+        batch_num = 0
+        for row in rows:
+            pid = row["podcastindex_id"]
+            itunes_id = row["itunesId"]
+            if not itunes_id:
+                missing += 1
+                missing_itunes += 1
+                continue
+            try:
+                label = f"Fetching Podscan... total={podscan_hits + 1}"
+                stop_event, thread = start_spinner(label)
+                try:
+                    country, email, podscan_data = fetch_podscan_country(itunes_id)
+                finally:
+                    stop_event.set()
+                    thread.join()
+                    sys.stdout.write("\r" + " " * (len(label) + 4) + "\r")
+                    sys.stdout.flush()
+            except Exception as exc:
+                print(
+                    f"❌ Podscan lookup failed for itunesId={itunes_id}: {exc}",
+                    file=sys.stderr,
+                )
+                return 1
+            podscan_hits += 1
+            if args.pid is not None:
+                out_path = Path("tests") / f"podscan_by_itunesid_{pid}.txt"
+                if podscan_data is not None:
+                    out_path.write_text(
+                        json.dumps(podscan_data, indent=2, ensure_ascii=True) + "\n"
+                    )
+            if country == "404":
+                missing += 1
+                not_found_404 += 1
+            elif not country:
+                missing += 1
+                missing_country += 1
+            if args.print_only:
+                print(
+                    f"podcastindex_id={pid} itunesId={itunes_id} country={country or ''} email={email or ''}"
+                )
+            else:
+                conn.execute(
+                    """
+                    INSERT OR IGNORE INTO creator_country (podcastindex_id, itunesid, country)
+                    VALUES (?, ?, ?)
+                    """,
+                    (pid, itunes_id, country),
+                )
+                inserted += 1
+            if podscan_hits % 25 == 0:
+                batch_num += 1
+                print(
+                    "📊 Batch {batch} done: podscan_hits={hits} "
+                    "warnings(missing_itunes={mi}, country_missing={mc}, podscan_404={nf}).".format(
+                        batch=batch_num,
+                        hits=podscan_hits,
+                        mi=missing_itunes,
+                        mc=missing_country,
+                        nf=not_found_404,
+                    )
+                )
+                sleep_with_countdown(20)
+
+        if not args.print_only:
+            conn.commit()
+            print(
+                "✅ Stored country for {inserted} creators. Warnings: {missing} "
+                "(missing_itunes={mi}, country_missing={mc}, podscan_404={nf}).".format(
+                    inserted=inserted,
+                    missing=missing,
+                    mi=missing_itunes,
+                    mc=missing_country,
+                    nf=not_found_404,
+                )
+            )
+        else:
+            print(
+                "✅ Print-only complete. Found {found} countries; warnings: {missing} "
+                "(missing_itunes={mi}, country_missing={mc}, podscan_404={nf}).".format(
+                    found=len(rows) - missing,
+                    missing=missing,
+                    mi=missing_itunes,
+                    mc=missing_country,
+                    nf=not_found_404,
+                )
+            )
+        return 0
+    finally:
+        conn.close()
+
+
 def get_normalized_entity(conn: sqlite3.Connection, entity_type: str, entity_id: int) -> Optional[sqlite3.Row]:
     return conn.execute(
         """
@@ -3854,7 +4141,12 @@ def embed_entity(args: argparse.Namespace) -> int:
         "geo",
     ]
     entity_type = args.entity_type
-    embedding_provider = "openai" if getattr(args, "openai", False) else getattr(args, "embedding_provider", "local")
+    if getattr(args, "openai", False):
+        embedding_provider = "openai"
+    elif getattr(args, "embedding_provider", None):
+        embedding_provider = args.embedding_provider
+    else:
+        embedding_provider = resolve_llm_provider(LLM_PROVIDER_EMBED, "local")
     if embedding_provider == "openai":
         embedding_model = "text-embedding-3-large"
     else:
@@ -4746,8 +5038,8 @@ def parse_args(argv: Optional[Sequence[str]] = None) -> argparse.Namespace:
     embed_entity_parser.add_argument(
         "--embedding-provider",
         choices=["openai", "local"],
-        default="local",
-        help="Provider for embeddings (default: local via Ollama; use openai to call OpenAI embeddings)",
+        default=None,
+        help="Provider for embeddings (default from LLM_PROVIDER_EMBED or local via Ollama; use openai to call OpenAI embeddings)",
     )
     embed_entity_parser.add_argument(
         "--openai",
@@ -4850,6 +5142,33 @@ def parse_args(argv: Optional[Sequence[str]] = None) -> argparse.Namespace:
         help="podcastindex_id (from creators) to inspect",
     )
     test_enrich.add_argument(
+        "--adl-db",
+        type=Path,
+        default=Path("adelined_matching.db"),
+        help="Path to Adelined SQLite database (default: adelined_matching.db)",
+    )
+
+    find_country = subparsers.add_parser(
+        "find-creator-country",
+        help="Lookup and store creator country via Podscan (itunesId)",
+    )
+    find_country.add_argument(
+        "--limit",
+        type=int,
+        default=50,
+        help="Max rows to process (default: 50; set 0 for no limit)",
+    )
+    find_country.add_argument(
+        "--print-only",
+        action="store_true",
+        help="Print resolved countries without writing to the database",
+    )
+    find_country.add_argument(
+        "--pid",
+        type=int,
+        help="Specific podcastindex_id to lookup (forces print-only)",
+    )
+    find_country.add_argument(
         "--adl-db",
         type=Path,
         default=Path("adelined_matching.db"),
@@ -4961,6 +5280,8 @@ def main(argv: Optional[Sequence[str]] = None) -> int:
         return test_enrich(args)
     if args.action == "export":
         return export_entity(args)
+    if args.action == "find-creator-country":
+        return find_creator_country(args)
     source = getattr(args, "source", "")
     print(f"Unknown action/source combination: {args.action} {source}")
     return 1
@@ -4989,6 +5310,7 @@ Commands:
   python3 adl test-compare --text1/--file1 --text2/--file2
   python3 adl test-enrich --pid <podcastindex_id>
   python3 adl export --target creator|brand --id <id> [--out path]
+  python3 adl find-creator-country [--limit N]
 
 Examples:
   # YouTube: fetch channel metadata by handles

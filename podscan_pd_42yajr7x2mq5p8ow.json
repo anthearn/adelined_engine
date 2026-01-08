@@ -1,0 +1,50 @@
+{
+    "podcast": {
+        "podcast_id": "pd_42yajr7x2mq5p8ow",
+        "podcast_guid": "ef044aa2-9843-587a-8ad8-1bce305fcbbd",
+        "podcast_name": "The Christmas Connection",
+        "podcast_url": "https://www.spreaker.com/podcast/the-christmas-connection--6755617",
+        "podcast_description": "\ud83c\udf84\u2728 Step into the wonder of Christmas\u2014anytime of the year! Hosted by seasoned broadcaster Dawn Mac, The Christmas Connection Podcast isn\u2019t just about the holidays\u2026it\u2019s about reliving the magic that makes them unforgettable. Each episode invites you to laugh, reminisce, and celebrate through festive stories, movie and music highlights, and conversations that warm the heart. If you believe Christmas is more than a season\u2014it\u2019s a feeling\u2014you\u2019ve just found your new favorite podcast. Tune in and make every day feel like a holiday with The Christmas Connection.",
+        "podcast_image_url": "https://d3wo5wojvuv7l.cloudfront.net/t_rss_itunes_square_1400/images.spreaker.com/original/d7b637fc0dbf2584c03b926dcd07936f.jpg",
+        "podcast_categories": [],
+        "podcast_has_guests": true,
+        "podcast_has_sponsors": false,
+        "podcast_itunes_id": "0",
+        "podcast_spotify_id": null,
+        "podcast_reach_score": 24,
+        "publisher_name": "The Christmas Connection",
+        "brand_safety": {
+            "framework": "GARM",
+            "risk_level": "none",
+            "recommendation": "safe"
+        },
+        "reach": {
+            "itunes": {
+                "itunes_rating_average": "",
+                "itunes_rating_count": "",
+                "itunes_rating_count_bracket": "0-10"
+            },
+            "spotify": {
+                "spotify_rating_average": "",
+                "spotify_rating_count": "",
+                "spotify_rating_count_bracket": "0-10"
+            },
+            "audience_size": 100,
+            "social_links": [],
+            "email": "christmasconnectionpodcast@gmail.com",
+            "website": "https://www.spreaker.com/podcast/the-christmas-connection--6755617"
+        },
+        "rss_url": "https://www.spreaker.com/show/6755617/episodes/feed",
+        "is_active": true,
+        "episode_count": 18,
+        "episodes_in_database": 18,
+        "language": "en",
+        "region": "us",
+        "last_posted_at": "2025-12-12T05:00:07+00:00",
+        "last_scanned_at": "2026-01-08T11:09:42+00:00",
+        "created_at": "2025-10-02T18:33:23+00:00",
+        "updated_at": "2026-01-08T11:09:42+00:00",
+        "is_duplicate": false,
+        "is_duplicate_of": null
+    }
+}
