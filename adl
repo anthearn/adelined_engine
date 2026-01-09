@@ -16,7 +16,7 @@ import sys
 import threading
 import time
 from dataclasses import dataclass
-from datetime import datetime
+from datetime import datetime, timedelta
 from pathlib import Path
 from typing import Dict, Iterable, List, Optional, Sequence, Tuple
 
@@ -619,6 +619,23 @@ def ensure_creator_country_table(conn: sqlite3.Connection) -> None:
             podcastindex_id INTEGER PRIMARY KEY,
             itunesid INTEGER,
             country TEXT
+        )
+        """
+    )
+
+
+def ensure_podscan_table(conn: sqlite3.Connection) -> None:
+    conn.execute(
+        """
+        CREATE TABLE IF NOT EXISTS podscan (
+            id TEXT PRIMARY KEY,
+            guid TEXT,
+            podcastindex_id INTEGER,
+            itunesid INTEGER,
+            email TEXT,
+            website TEXT,
+            full_json TEXT,
+            region TEXT
         )
         """
     )
@@ -1507,6 +1524,29 @@ def fetch_podscan_country(
                 email = url
                 break
     return (str(region).upper() if region else None), email, data
+
+
+def extract_podscan_contact(podcast: Dict) -> Tuple[Optional[str], Optional[str]]:
+    reach = podcast.get("reach") or {}
+    social_links = reach.get("social_links") or []
+    email = reach.get("email")
+    website = reach.get("website") or podcast.get("podcast_url")
+    if not email or not website:
+        for link in social_links:
+            item = link or {}
+            if not email:
+                link_email = item.get("email")
+                if link_email:
+                    email = link_email
+            if not website:
+                website = item.get("website")
+                if not website:
+                    url = item.get("url") or ""
+                    if item.get("platform") == "website" and url:
+                        website = url
+            if email and website:
+                break
+    return email, website
 
 
 def fetch_spotify_metadata(show_url: Optional[str], title: str) -> Dict:
@@ -3851,6 +3891,130 @@ def find_creator_country(args: argparse.Namespace) -> int:
         conn.close()
 
 
+def update_from_podscan(args: argparse.Namespace) -> int:
+    db_path = Path(args.adl_db)
+    if not db_path.exists():
+        print(f"❌ DB not found: {db_path}", file=sys.stderr)
+        return 1
+    key = os.getenv("PODSCAN_API_KEY")
+    if not key:
+        print("❌ PODSCAN_API_KEY not set; cannot pull from Podscan.", file=sys.stderr)
+        return 1
+
+    per_page = max(1, min(int(args.per_page), 50))
+    limit = int(args.limit)
+    order_by = args.order_by
+    order_dir = "asc"
+    region = "GB"
+    month_only = args.month_only
+    min_last_episode = (datetime.utcnow() - timedelta(days=30 * 14)).strftime("%Y-%m-%d")
+    max_last_episode = None
+    if month_only:
+        try:
+            month_str, year_str = month_only.split("_", 1)
+            month = int(month_str)
+            year = int(year_str)
+            year = 2000 + year if year < 100 else year
+            if not (1 <= month <= 12):
+                raise ValueError("month out of range")
+        except ValueError as exc:
+            print(f"❌ Invalid --month_only value '{month_only}': {exc}", file=sys.stderr)
+            return 1
+        start = datetime(year, month, 1)
+        if month == 12:
+            end = datetime(year + 1, 1, 1) - timedelta(days=1)
+        else:
+            end = datetime(year, month + 1, 1) - timedelta(days=1)
+        min_last_episode = start.strftime("%Y-%m-%d")
+        max_last_episode = end.strftime("%Y-%m-%d")
+
+    headers = {
+        "Authorization": f"Bearer {key}",
+        "Accept": "application/json",
+        "User-Agent": "adelined/1.0",
+    }
+    params = {
+        "per_page": per_page,
+        "order_by": order_by,
+        "order_dir": order_dir,
+        "region": region,
+        "min_last_episode_posted_at": min_last_episode,
+    }
+    if max_last_episode:
+        params["max_last_episode_posted_at"] = max_last_episode
+
+    conn = sqlite3.connect(db_path, timeout=10)
+    conn.row_factory = sqlite3.Row
+    configure_sqlite(conn)
+    try:
+        ensure_podscan_table(conn)
+
+        stored = 0
+        page = 1
+        total_pages = None
+        while True:
+            if limit != 0 and stored >= limit:
+                break
+            params["page"] = page
+            res = requests.get(
+                f"{PODSCAN_API_BASE}/podcasts/search",
+                headers=headers,
+                params=params,
+                timeout=20,
+            )
+            res.raise_for_status()
+            payload = res.json()
+            podcasts = payload.get("podcasts") or []
+            if total_pages is None:
+                pagination = payload.get("pagination") or {}
+                try:
+                    total_pages = int(pagination.get("last_page") or 1)
+                except (TypeError, ValueError):
+                    total_pages = 1
+            if not podcasts:
+                break
+
+            for podcast in podcasts:
+                if limit != 0 and stored >= limit:
+                    break
+                email, website = extract_podscan_contact(podcast)
+                verb = "INSERT OR REPLACE" if args.force else "INSERT OR IGNORE"
+                conn.execute(
+                    f"""
+                    {verb} INTO podscan
+                        (id, guid, podcastindex_id, itunesid, email, website, full_json, region)
+                    VALUES (?, ?, ?, ?, ?, ?, ?, ?)
+                    """,
+                    (
+                        podcast.get("podcast_id"),
+                        podcast.get("podcast_guid"),
+                        None,
+                        podcast.get("podcast_itunes_id"),
+                        email,
+                        website,
+                        json.dumps(podcast, ensure_ascii=True),
+                        podcast.get("region"),
+                    ),
+                )
+                stored += 1
+
+            if total_pages is not None and page >= total_pages:
+                break
+            page += 1
+
+        conn.commit()
+        print(
+            "✅ Stored {count} Podscan records (region=GB, min_last_episode_posted_at={min_date}{max_suffix}).".format(
+                count=stored,
+                min_date=min_last_episode,
+                max_suffix=f', max_last_episode_posted_at={max_last_episode}' if max_last_episode else "",
+            )
+        )
+        return 0
+    finally:
+        conn.close()
+
+
 def get_normalized_entity(conn: sqlite3.Connection, entity_type: str, entity_id: int) -> Optional[sqlite3.Row]:
     return conn.execute(
         """
@@ -3867,6 +4031,9 @@ def normalize_entities(args: argparse.Namespace) -> int:
     if not db_path.exists():
         print(f"❌ DB not found: {db_path}", file=sys.stderr)
         return 1
+    if getattr(args, "podscan", False) and args.entity_type != "creator":
+        print("❌ --podscan is only supported for creator normalization.", file=sys.stderr)
+        return 1
     conn = sqlite3.connect(db_path, timeout=10)
     conn.row_factory = sqlite3.Row
     configure_sqlite(conn)
@@ -3876,6 +4043,8 @@ def normalize_entities(args: argparse.Namespace) -> int:
     ensure_entity_normalized_table(conn)
     ensure_normalization_lexicon_table(conn)
     ensure_apple_categories_table(conn)
+    if getattr(args, "podscan", False):
+        ensure_podscan_table(conn)
 
     entity_type = args.entity_type
     provider = getattr(args, "llm_provider", "local")
@@ -3883,6 +4052,12 @@ def normalize_entities(args: argparse.Namespace) -> int:
     ids: List[int] = []
     if getattr(args, "id", None):
         ids = [args.id]
+    elif getattr(args, "podcastindex_ids", None):
+        if entity_type != "creator":
+            print("❌ --podcastindex_ids is only supported for creators.", file=sys.stderr)
+            conn.close()
+            return 1
+        ids = list(args.podcastindex_ids)
     elif getattr(args, "id_range", None):
         start_id, end_id = args.id_range
         if entity_type == "brand":
@@ -3911,7 +4086,7 @@ def normalize_entities(args: argparse.Namespace) -> int:
             ).fetchall()
             ids = [r[0] for r in rows]
     if not ids:
-        print("❌ Provide --id or --all-brands/--all-creators", file=sys.stderr)
+        print("❌ Provide --id, --podcastindex_ids, or --all-brands/--all-creators", file=sys.stderr)
         conn.close()
         return 1
 
@@ -3946,28 +4121,58 @@ def normalize_entities(args: argparse.Namespace) -> int:
                 if row[key]:
                     fields_parts.append(f"{key.upper()}: {row[key]}")
         else:
-            row = conn.execute(
-                """
-                SELECT c.*, ce.cleaned_text_block, ce.raw_text_sources
-                FROM creators c
-                LEFT JOIN creator_enrichment ce ON ce.podcastindex_id = c.podcastindex_id
-                WHERE c.podcastindex_id=?
-                """,
-                (eid,),
-            ).fetchone()
+            if getattr(args, "podscan", False):
+                ensure_podscan_table(conn)
+                row = conn.execute(
+                    """
+                    SELECT c.*, p.full_json AS podscan_json
+                    FROM creators c
+                    LEFT JOIN podscan p ON p.podcastindex_id = c.podcastindex_id
+                    WHERE c.podcastindex_id=?
+                    """,
+                    (eid,),
+                ).fetchone()
+            else:
+                row = conn.execute(
+                    """
+                    SELECT c.*, ce.cleaned_text_block, ce.raw_text_sources
+                    FROM creators c
+                    LEFT JOIN creator_enrichment ce ON ce.podcastindex_id = c.podcastindex_id
+                    WHERE c.podcastindex_id=?
+                    """,
+                    (eid,),
+                ).fetchone()
             if not row:
                 continue
             name = row["title"] or f"podcast {eid}"
-            for key in ["title", "description", "categories", "cleaned_text_block"]:
-                if row.get(key) if isinstance(row, dict) else row[key]:
-                    fields_parts.append(f"{key.upper()}: {row[key]}")
-            try:
-                raw_sources = json.loads(row["raw_text_sources"]) if row["raw_text_sources"] else {}
-            except Exception:
-                raw_sources = {}
-            for k, v in (raw_sources or {}).items():
-                if v:
-                    fields_parts.append(f"{k.upper()}: {v}")
+            if getattr(args, "podscan", False):
+                podscan_json = row["podscan_json"]
+                if not podscan_json:
+                    print(f"⚠️ No Podscan JSON for creator {eid}; skipping.")
+                    continue
+                try:
+                    pod = json.loads(podscan_json)
+                except Exception:
+                    print(f"⚠️ Invalid Podscan JSON for creator {eid}; skipping.")
+                    continue
+                desc = pod.get("podcast_description") or ""
+                if pod.get("podcast_name"):
+                    name = pod.get("podcast_name") or name
+                if not desc:
+                    print(f"⚠️ Podscan description missing for creator {eid}; skipping.")
+                    continue
+                fields_parts.append(f"DESCRIPTION: {desc}")
+            else:
+                for key in ["title", "description", "categories", "cleaned_text_block"]:
+                    if row.get(key) if isinstance(row, dict) else row[key]:
+                        fields_parts.append(f"{key.upper()}: {row[key]}")
+                try:
+                    raw_sources = json.loads(row["raw_text_sources"]) if row["raw_text_sources"] else {}
+                except Exception:
+                    raw_sources = {}
+                for k, v in (raw_sources or {}).items():
+                    if v:
+                        fields_parts.append(f"{k.upper()}: {v}")
         raw_blob = "\n".join(fields_parts)
         if len(raw_blob) > 12000:
             raw_blob = raw_blob[:12000]
@@ -4972,6 +5177,12 @@ def parse_args(argv: Optional[Sequence[str]] = None) -> argparse.Namespace:
         metavar=("START_ID", "END_ID"),
         help="Normalize a contiguous id range (inclusive). Uses adlid for brands, podcastindex_id for creators.",
     )
+    norm_entity_parser.add_argument(
+        "--podcastindex_ids",
+        nargs="+",
+        type=int,
+        help="Space-delimited list of podcastindex_id values to process (creator-only)",
+    )
     norm_entity_parser.add_argument("--limit", type=int, default=100, help="Max rows to process (default 100)")
     norm_entity_parser.add_argument("--offset", type=int, default=0, help="Offset for bulk mode")
     norm_entity_parser.add_argument(
@@ -4989,6 +5200,11 @@ def parse_args(argv: Optional[Sequence[str]] = None) -> argparse.Namespace:
         "--force",
         action="store_true",
         help="Overwrite existing normalized rows for these entities",
+    )
+    norm_entity_parser.add_argument(
+        "--podscan",
+        action="store_true",
+        help="Use Podscan podcast_description as the sole source for creator normalization",
     )
     norm_entity_parser.add_argument(
         "--adl-db",
@@ -5175,6 +5391,52 @@ def parse_args(argv: Optional[Sequence[str]] = None) -> argparse.Namespace:
         help="Path to Adelined SQLite database (default: adelined_matching.db)",
     )
 
+    update_podscan = subparsers.add_parser(
+        "update_from_podscan",
+        help="Pull podcasts from Podscan search and store in the podscan table",
+    )
+    update_podscan.add_argument(
+        "--limit",
+        type=int,
+        default=50,
+        help="Max results to store (default: 50; set 0 for no limit)",
+    )
+    update_podscan.add_argument(
+        "--per_page",
+        type=int,
+        default=5,
+        help="Results per page (default: 5; max: 50)",
+    )
+    update_podscan.add_argument(
+        "--order_by",
+        default="created_at",
+        choices=[
+            "best_match",
+            "name",
+            "created_at",
+            "episode_count",
+            "rating",
+            "audience_size",
+            "last_posted_at",
+        ],
+        help="Field to order by (default: created_at)",
+    )
+    update_podscan.add_argument(
+        "--force",
+        action="store_true",
+        help="Overwrite existing podscan rows instead of skipping duplicates",
+    )
+    update_podscan.add_argument(
+        "--month_only",
+        help="Restrict last_posted_at to a month like 1_25 (Jan 2025)",
+    )
+    update_podscan.add_argument(
+        "--adl-db",
+        type=Path,
+        default=Path("adelined_matching.db"),
+        help="Path to Adelined SQLite database (default: adelined_matching.db)",
+    )
+
     return parser.parse_args(argv)
 
 
@@ -5282,6 +5544,8 @@ def main(argv: Optional[Sequence[str]] = None) -> int:
         return export_entity(args)
     if args.action == "find-creator-country":
         return find_creator_country(args)
+    if args.action == "update_from_podscan":
+        return update_from_podscan(args)
     source = getattr(args, "source", "")
     print(f"Unknown action/source combination: {args.action} {source}")
     return 1
@@ -5311,6 +5575,7 @@ Commands:
   python3 adl test-enrich --pid <podcastindex_id>
   python3 adl export --target creator|brand --id <id> [--out path]
   python3 adl find-creator-country [--limit N]
+  python3 adl update_from_podscan [--limit N] [--per_page N] [--order_by field]
 
 Examples:
   # YouTube: fetch channel metadata by handles
