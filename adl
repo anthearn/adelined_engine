@@ -4125,9 +4125,8 @@ def normalize_entities(args: argparse.Namespace) -> int:
                 ensure_podscan_table(conn)
                 row = conn.execute(
                     """
-                    SELECT c.*, p.full_json AS podscan_json
+                    SELECT c.*
                     FROM creators c
-                    LEFT JOIN podscan p ON p.podcastindex_id = c.podcastindex_id
                     WHERE c.podcastindex_id=?
                     """,
                     (eid,),
@@ -4146,7 +4145,19 @@ def normalize_entities(args: argparse.Namespace) -> int:
                 continue
             name = row["title"] or f"podcast {eid}"
             if getattr(args, "podscan", False):
-                podscan_json = row["podscan_json"]
+                podscan_row = conn.execute(
+                    """
+                    SELECT full_json
+                    FROM podscan
+                    WHERE CAST(podcastindex_id AS INTEGER) = ?
+                      AND full_json IS NOT NULL
+                      AND TRIM(full_json) <> ''
+                    ORDER BY LENGTH(full_json) DESC
+                    LIMIT 1
+                    """,
+                    (eid,),
+                ).fetchone()
+                podscan_json = podscan_row["full_json"] if podscan_row else None
                 if not podscan_json:
                     print(f"⚠️ No Podscan JSON for creator {eid}; skipping.")
                     continue
