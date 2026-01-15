@@ -624,6 +624,41 @@ def ensure_creator_country_table(conn: sqlite3.Connection) -> None:
     )
 
 
+def ensure_creator_clusters_table(conn: sqlite3.Connection) -> None:
+    conn.execute(
+        """
+        CREATE TABLE IF NOT EXISTS creator_clusters (
+            podcastindex_id INTEGER,
+            cluster_id INTEGER,
+            vector_type TEXT,
+            model_name TEXT,
+            method TEXT,
+            params_json TEXT,
+            created_at DATETIME DEFAULT CURRENT_TIMESTAMP,
+            PRIMARY KEY (podcastindex_id, vector_type, method)
+        )
+        """
+    )
+
+
+def ensure_creator_cluster_labels_table(conn: sqlite3.Connection) -> None:
+    conn.execute(
+        """
+        CREATE TABLE IF NOT EXISTS creator_cluster_labels (
+            cluster_id INTEGER,
+            vector_type TEXT,
+            method TEXT,
+            label TEXT,
+            top_topics TEXT,
+            top_keywords TEXT,
+            size INTEGER,
+            created_at DATETIME DEFAULT CURRENT_TIMESTAMP,
+            PRIMARY KEY (cluster_id, vector_type, method)
+        )
+        """
+    )
+
+
 def ensure_podscan_table(conn: sqlite3.Connection) -> None:
     conn.execute(
         """
@@ -2657,6 +2692,7 @@ def enrich_creators(args: argparse.Namespace) -> int:
                 f"Spotify ok: {stats['spotify_ok']}, missing creds: {stats['spotify_missing']}, other: {stats['spotify_not_found']}; "
                 f"YouTube ok: {stats['youtube_ok']}, missing creds: {stats['youtube_missing']}, other: {stats['youtube_not_found']}"
             )
+        print(f"ℹ️ Checked {attempted_rows} candidate rows; enriched {enriched_rows}.")
         return 0
     finally:
         conn.close()
@@ -3986,69 +4022,108 @@ def ingest_brand(args: argparse.Namespace) -> int:
 
 
 def test_compare(args: argparse.Namespace) -> int:
-    def load_text(txt: Optional[str], path: Optional[Path]) -> Optional[str]:
-        if txt:
-            return txt
-        if path and path.exists():
-            return path.read_text()
-        return None
-
-    if hasattr(args, "brand_id") and getattr(args, "brand_id", None) and hasattr(args, "creator_id") and getattr(args, "creator_id", None):
-        db_path = Path(getattr(args, "adl_db", "adelined_matching.db"))
-        if not db_path.exists():
-            print(f"❌ DB not found: {db_path}", file=sys.stderr)
-            return 1
-        conn = sqlite3.connect(db_path, timeout=10)
-        conn.row_factory = sqlite3.Row
-        configure_sqlite(conn)
-        bmap = load_embeddings_map(conn, "brand", args.brand_id)
-        cmap = load_embeddings_map(conn, "creator", args.creator_id)
-        if not bmap or not cmap:
-            print("❌ Missing embeddings for provided ids.", file=sys.stderr)
-            return 1
-        weights = {
-            "semantic_summary": 0.25,
-            "audience": 0.25,
-            "pain_points": 0.15,
-            "vertical": 0.15,
-            "topics": 0.10,
-            "tone": 0.05,
-            "geo": 0.05,
-        }
-        sims = {}
-        for vt, w in weights.items():
-            if vt in bmap and vt in cmap:
-                sims[vt] = cosine_similarity(bmap[vt], cmap[vt])
-        num = sum(sims.get(vt, 0) * w for vt, w in weights.items() if vt in sims)
-        denom = sum(w for vt, w in weights.items() if vt in sims)
-        final_score = num / denom if denom else 0.0
-        print("TEST COMPARISON RESULT")
-        print("======================")
-        print(f"Final score: {final_score:.3f}")
-        print(f"Interpretation: {relevance_label(final_score)}")
-        print("\nPer-dimension:")
-        for vt, val in sims.items():
-            print(f"  {vt:16s}: {val:.3f}")
+    if getattr(args, "text1", None) or getattr(args, "text2", None) or getattr(args, "file1", None) or getattr(args, "file2", None):
+        print("❌ test-compare no longer accepts raw text. Use stored embeddings with --entity-1/--entity-2.", file=sys.stderr)
+        return 1
+    entity_1 = getattr(args, "entity_1", None)
+    entity_2 = getattr(args, "entity_2", None)
+    if not entity_1 or not entity_2 or len(entity_1) != 2 or len(entity_2) != 2:
+        print("❌ Provide --entity-1 <id> <brand|creator> and --entity-2 <id> <brand|creator>.", file=sys.stderr)
+        return 1
+    try:
+        entity_1_id = int(entity_1[0])
+        entity_2_id = int(entity_2[0])
+    except ValueError:
+        print("❌ Entity ids must be integers.", file=sys.stderr)
+        return 1
+    entity_1_type = entity_1[1].lower()
+    entity_2_type = entity_2[1].lower()
+    if entity_1_type not in ("brand", "creator") or entity_2_type not in ("brand", "creator"):
+        print("❌ Entity types must be 'brand' or 'creator'.", file=sys.stderr)
+        return 1
+    db_path = Path(getattr(args, "adl_db", "adelined_matching.db"))
+    if not db_path.exists():
+        print(f"❌ DB not found: {db_path}", file=sys.stderr)
+        return 1
+    conn = sqlite3.connect(db_path, timeout=10)
+    conn.row_factory = sqlite3.Row
+    configure_sqlite(conn)
+    bmap = load_embeddings_map(conn, entity_1_type, entity_1_id)
+    cmap = load_embeddings_map(conn, entity_2_type, entity_2_id)
+    if not bmap or not cmap:
+        print("❌ Missing embeddings for one or both entities.", file=sys.stderr)
         conn.close()
-        return 0
-
-    t1 = load_text(args.text1, args.file1)
-    t2 = load_text(args.text2, args.file2)
-    if not t1 or not t2:
-        print("❌ Provide both inputs via --text1/--file1 and --text2/--file2", file=sys.stderr)
         return 1
-
-    v1 = embed_text_block(t1)
-    v2 = embed_text_block(t2)
-    if not v1 or not v2:
-        print("❌ Failed to embed one or both inputs.", file=sys.stderr)
-        return 1
-
-    score = cosine_similarity(v1, v2)
+    weights = {
+        "semantic_summary": 0.25,
+        "audience": 0.25,
+        "pain_points": 0.15,
+        "vertical": 0.15,
+        "topics": 0.10,
+        "tone": 0.05,
+        "geo": 0.05,
+    }
+    sims = {}
+    for vt, w in weights.items():
+        if vt in bmap and vt in cmap:
+            sims[vt] = cosine_similarity(bmap[vt], cmap[vt])
+    num = sum(sims.get(vt, 0) * w for vt, w in weights.items() if vt in sims)
+    denom = sum(w for vt, w in weights.items() if vt in sims)
+    final_score = num / denom if denom else 0.0
     print("TEST COMPARISON RESULT")
     print("======================")
-    print(f"Similarity score: {score:.3f}")
-    print(f"Interpretation: {relevance_label(score)}")
+    print(f"Final score: {final_score:.3f}")
+    print(f"Interpretation: {relevance_label(final_score)}")
+    print("\nPer-dimension:")
+    for vt, val in sims.items():
+        print(f"  {vt:16s}: {val:.3f}")
+    conn.close()
+    return 0
+
+
+def compare_creators(args: argparse.Namespace) -> int:
+    db_path = Path(getattr(args, "adl_db", "adelined_matching.db"))
+    if not db_path.exists():
+        print(f"❌ DB not found: {db_path}", file=sys.stderr)
+        return 1
+    creator_id_1 = args.creator_id
+    creator_id_2 = args.creator_id_2
+    if not creator_id_1 or not creator_id_2:
+        print("❌ Provide --creator-id and --creator-id-2", file=sys.stderr)
+        return 1
+    conn = sqlite3.connect(db_path, timeout=10)
+    conn.row_factory = sqlite3.Row
+    configure_sqlite(conn)
+    bmap = load_embeddings_map(conn, "creator", creator_id_1)
+    cmap = load_embeddings_map(conn, "creator", creator_id_2)
+    if not bmap or not cmap:
+        print("❌ Missing embeddings for one or both creators.", file=sys.stderr)
+        conn.close()
+        return 1
+    weights = {
+        "semantic_summary": 0.25,
+        "audience": 0.25,
+        "pain_points": 0.15,
+        "vertical": 0.15,
+        "topics": 0.10,
+        "tone": 0.05,
+        "geo": 0.05,
+    }
+    sims = {}
+    for vt, w in weights.items():
+        if vt in bmap and vt in cmap:
+            sims[vt] = cosine_similarity(bmap[vt], cmap[vt])
+    num = sum(sims.get(vt, 0) * w for vt, w in weights.items() if vt in sims)
+    denom = sum(w for vt, w in weights.items() if vt in sims)
+    final_score = num / denom if denom else 0.0
+    print("CREATOR COMPARISON RESULT")
+    print("=========================")
+    print(f"Final score: {final_score:.3f}")
+    print(f"Interpretation: {relevance_label(final_score)}")
+    print("\nPer-dimension:")
+    for vt, val in sims.items():
+        print(f"  {vt:16s}: {val:.3f}")
+    conn.close()
     return 0
 
 
@@ -4470,7 +4545,7 @@ def normalize_entities(args: argparse.Namespace) -> int:
         ensure_podscan_table(conn)
 
     entity_type = args.entity_type
-    provider = getattr(args, "llm_provider", "local")
+    provider = getattr(args, "llm_provider", resolve_llm_provider(LLM_PROVIDER_META_ENRICH, "local"))
     ollama_model = getattr(args, "ollama_model", LOCAL_OLLAMA_MODEL)
     ids: List[int] = []
     if getattr(args, "id", None):
@@ -4551,14 +4626,18 @@ def normalize_entities(args: argparse.Namespace) -> int:
         if not ensure_openai_confirmation("normalization", allow_fallback=True):
             provider = "local"
 
+    total_ids = len(ids)
     normalized = 0
     attempted = 0
+    skipped_existing = 0
+    print(f"Normalizing {total_ids} {entity_type}(s)...")
     for eid in ids:
         exists = conn.execute(
             "SELECT 1 FROM entity_normalized WHERE entity_type=? AND entity_id=? AND version='v1'",
             (entity_type, eid),
         ).fetchone()
         if exists and not getattr(args, "force", False):
+            skipped_existing += 1
             continue
         name = ""
         fields_parts: List[str] = []
@@ -4728,7 +4807,7 @@ def normalize_entities(args: argparse.Namespace) -> int:
             conn.commit()
             print(f"Normalized {normalized}/{len(ids)}...", end="\r")
     conn.commit()
-    print(f"\n✅ Normalized {normalized} entities of {attempted} attempted.")
+    print(f"\n✅ Normalized {normalized} entities of {attempted} attempted. Skipped existing: {skipped_existing}.")
     conn.close()
     return 0
 
@@ -4762,6 +4841,72 @@ def build_embedding_text(entity: sqlite3.Row, entity_type: str, vector_type: str
     if vector_type == "geo":
         return f"GEO:\n{geo}"
     return None
+
+
+def build_identity_text(entity: sqlite3.Row, entity_type: str) -> Optional[str]:
+    if entity_type == "creator":
+        name = entity["title"] or ""
+        summary = entity["normalized_summary"] or ""
+        keywords = entity["industry_keywords"] or ""
+        topics = entity["normalized_topics"] or ""
+    else:
+        name = entity["brand_name"] or ""
+        summary = entity["normalized_summary"] or ""
+        keywords = entity["brand_keywords"] or ""
+        topics = entity["normalized_topics"] or ""
+    parts = [part for part in [name, summary] if part and str(part).strip()]
+    if keywords and str(keywords).strip():
+        parts.append(f"KEYWORDS: {keywords}")
+    if topics and str(topics).strip():
+        parts.append(f"TOPICS: {topics}")
+    text = "\n".join(parts).strip()
+    return text if text else None
+
+
+def extract_identity_text_from_block(text: str) -> str:
+    if not text:
+        return text
+    headers = [
+        "NAME:",
+        "SUMMARY:",
+        "VERTICAL:",
+        "AUDIENCE:",
+        "FUNCTIONS:",
+        "USE_CASES:",
+        "KEYWORDS:",
+        "PAIN_POINTS:",
+        "GEO:",
+        "TOPICS:",
+    ]
+    normalized = text
+    for header in headers:
+        normalized = normalized.replace(f" {header}", f"\n{header}")
+    lines = [line.rstrip() for line in normalized.splitlines()]
+    sections = {}
+    current = None
+    for line in lines:
+        if line.strip() in headers:
+            current = line.strip()
+            sections[current] = []
+            continue
+        if current is not None:
+            sections[current].append(line)
+    name = " ".join(sections.get("NAME:", [])).strip()
+    summary = " ".join(sections.get("SUMMARY:", [])).strip()
+    keywords = " ".join(sections.get("KEYWORDS:", [])).strip()
+    topics = " ".join(sections.get("TOPICS:", [])).strip()
+    parts = []
+    if name:
+        parts.append(name)
+    if summary:
+        parts.append(summary)
+    if keywords:
+        parts.append(f"KEYWORDS: {keywords}")
+    if topics:
+        parts.append(f"TOPICS: {topics}")
+    if parts:
+        return "\n".join(parts).strip()
+    return text
 
 
 def compute_embedding_confidence(entity: sqlite3.Row) -> float:
@@ -4798,17 +4943,21 @@ def embed_entity(args: argparse.Namespace) -> int:
     ensure_creators_table(conn)
     ensure_brands_table(conn)
 
-    vector_types = [
-        "semantic_summary",
-        "topics",
-        "vertical",
-        "audience",
-        "pain_points",
-        "use_cases",
-        "themes",
-        "tone",
-        "geo",
-    ]
+    embedding_mode = getattr(args, "embedding_mode", "identity")
+    if embedding_mode == "identity":
+        vector_types = ["semantic_summary", "topics"]
+    else:
+        vector_types = [
+            "semantic_summary",
+            "topics",
+            "vertical",
+            "audience",
+            "pain_points",
+            "use_cases",
+            "themes",
+            "tone",
+            "geo",
+        ]
     entity_type = args.entity_type
     if getattr(args, "openai", False):
         embedding_provider = "openai"
@@ -4879,6 +5028,21 @@ def embed_entity(args: argparse.Namespace) -> int:
         JOIN creators c ON c.podcastindex_id = en.entity_id
         WHERE en.entity_type='creator' AND en.version='v1'
     """
+    if getattr(args, "podscan", False):
+        if entity_type != "creator":
+            print("❌ --podscan is only supported for creators.", file=sys.stderr)
+            conn.close()
+            return 1
+        ensure_podscan_table(conn)
+        base_query_creator = """
+            SELECT en.id as norm_id, en.normalized_block, c.*
+            FROM entity_normalized en
+            JOIN creators c ON c.podcastindex_id = en.entity_id
+            JOIN podscan ps ON ps.podcastindex_id = en.entity_id
+            WHERE en.entity_type='creator' AND en.version='v1'
+              AND ps.full_json IS NOT NULL
+              AND TRIM(ps.full_json) <> ''
+        """
     base_query_brand = """
         SELECT en.id as norm_id, en.normalized_block, b.*
         FROM entity_normalized en
@@ -4907,13 +5071,32 @@ def embed_entity(args: argparse.Namespace) -> int:
     total = len(rows)
     for r in rows:
         ent_id = r["podcastindex_id"] if entity_type == "creator" else r["adlid"]
-        conn.execute(
-            "DELETE FROM entity_embeddings WHERE entity_type=? AND entity_id=?",
-            (entity_type, ent_id),
-        )
+        existing = conn.execute(
+            """
+            SELECT vector_type
+            FROM entity_embeddings
+            WHERE entity_type=? AND entity_id=? AND model_name=?
+            """,
+            (entity_type, ent_id, model_name),
+        ).fetchall()
+        existing_types = {row["vector_type"] for row in existing}
+        if existing_types and not getattr(args, "force", False):
+            missing = [vt for vt in vector_types if vt not in existing_types]
+            if not missing:
+                continue
+        else:
+            if getattr(args, "force", False):
+                conn.execute(
+                    "DELETE FROM entity_embeddings WHERE entity_type=? AND entity_id=?",
+                    (entity_type, ent_id),
+                )
+            missing = list(vector_types)
         confidence = compute_embedding_confidence(r)
-        for vt in vector_types:
-            text = build_embedding_text(r, entity_type, vt)
+        for vt in missing:
+            if embedding_mode == "identity" and vt == "semantic_summary":
+                text = build_identity_text(r, entity_type)
+            else:
+                text = build_embedding_text(r, entity_type, vt)
             if not text or not text.strip():
                 continue
             vec = embed_text_block(text, provider=embedding_provider, model=embedding_model)
@@ -5078,6 +5261,270 @@ def relevance_label(score: float) -> str:
 
 
 # Override with multi-dimensional ranking using entity_embeddings
+def cluster_creators(args: argparse.Namespace) -> int:
+    db_path = Path(args.adl_db)
+    if not db_path.exists():
+        print(f"❌ DB not found: {db_path}", file=sys.stderr)
+        return 1
+    try:
+        import numpy as np
+    except Exception:
+        print("❌ numpy is required for clustering. Install it and retry.", file=sys.stderr)
+        return 1
+    method = args.method
+    if method == "hdbscan":
+        try:
+            import hdbscan  # type: ignore
+        except Exception:
+            print("❌ hdbscan is required. pip install hdbscan", file=sys.stderr)
+            return 1
+    else:
+        try:
+            from sklearn.cluster import KMeans  # type: ignore
+        except Exception:
+            print("❌ scikit-learn is required. pip install scikit-learn", file=sys.stderr)
+            return 1
+    conn = sqlite3.connect(db_path, timeout=10)
+    conn.row_factory = sqlite3.Row
+    configure_sqlite(conn)
+    ensure_entity_embeddings_table(conn)
+    ensure_creators_table(conn)
+    ensure_creator_clusters_table(conn)
+    ensure_creator_cluster_labels_table(conn)
+
+    vector_type = args.vector_type
+    rows = conn.execute(
+        """
+        SELECT ee.entity_id, ee.embedding_vector, ee.model_name,
+               c.normalized_topics, c.normalized_vertical, c.industry_keywords
+        FROM entity_embeddings ee
+        JOIN creators c ON c.podcastindex_id = ee.entity_id
+        WHERE ee.entity_type='creator' AND ee.vector_type=?
+        """,
+        (vector_type,),
+    ).fetchall()
+    if not rows:
+        print("❌ No creator embeddings found for vector_type.", file=sys.stderr)
+        conn.close()
+        return 1
+    ids = []
+    vectors = []
+    meta = {}
+    model_name = None
+    for r in rows:
+        vec = parse_embedding(r["embedding_vector"])
+        if not vec:
+            continue
+        ids.append(r["entity_id"])
+        vectors.append(vec)
+        meta[r["entity_id"]] = {
+            "topics": r["normalized_topics"] or "",
+            "vertical": r["normalized_vertical"] or "",
+            "keywords": r["industry_keywords"] or "",
+        }
+        if not model_name:
+            model_name = r["model_name"]
+    if not vectors:
+        print("❌ No valid embeddings to cluster.", file=sys.stderr)
+        conn.close()
+        return 1
+    X = np.array(vectors)
+
+    params = {"vector_type": vector_type}
+    if method == "hdbscan":
+        params["min_cluster_size"] = args.min_cluster_size
+        params["min_samples"] = args.min_samples
+        clusterer = hdbscan.HDBSCAN(
+            min_cluster_size=args.min_cluster_size,
+            min_samples=args.min_samples,
+        )
+        labels = clusterer.fit_predict(X)
+        if args.suggest_k:
+            uniq = sorted({int(x) for x in labels if x >= 0})
+            print(f"Suggested k from HDBSCAN: {len(uniq)}")
+    else:
+        k = args.k
+        if not k or k < 2:
+            print("❌ --k is required for kmeans and must be >= 2.", file=sys.stderr)
+            conn.close()
+            return 1
+        params["k"] = k
+        clusterer = KMeans(n_clusters=k, random_state=42, n_init="auto")
+        labels = clusterer.fit_predict(X)
+
+    conn.execute(
+        "DELETE FROM creator_clusters WHERE vector_type=? AND method=?",
+        (vector_type, method),
+    )
+    conn.execute(
+        "DELETE FROM creator_cluster_labels WHERE vector_type=? AND method=?",
+        (vector_type, method),
+    )
+
+    insert_rows = []
+    for idx, cid in enumerate(labels):
+        insert_rows.append(
+            (
+                ids[idx],
+                int(cid),
+                vector_type,
+                model_name or "",
+                method,
+                json.dumps(params),
+            )
+        )
+    conn.executemany(
+        """
+        INSERT INTO creator_clusters (
+            podcastindex_id, cluster_id, vector_type, model_name, method, params_json
+        ) VALUES (?, ?, ?, ?, ?, ?)
+        """,
+        insert_rows,
+    )
+
+    def tokenize(raw: str) -> List[str]:
+        if not raw:
+            return []
+        parts = [p.strip().lower() for p in raw.split(",") if p.strip()]
+        return parts
+
+    cluster_stats = {}
+    for idx, cid in enumerate(labels):
+        if cid not in cluster_stats:
+            cluster_stats[cid] = {"topics": [], "keywords": [], "verticals": []}
+        info = meta.get(ids[idx], {})
+        cluster_stats[cid]["topics"].extend(tokenize(info.get("topics", "")))
+        cluster_stats[cid]["keywords"].extend(tokenize(info.get("keywords", "")))
+        cluster_stats[cid]["verticals"].extend(tokenize(info.get("vertical", "")))
+
+    def top_items(items: List[str], limit: int = 5) -> List[str]:
+        counts = {}
+        for item in items:
+            counts[item] = counts.get(item, 0) + 1
+        ranked = sorted(counts.items(), key=lambda x: x[1], reverse=True)
+        return [k for k, _ in ranked[:limit]]
+
+    label_rows = []
+    for cid, data in cluster_stats.items():
+        top_topics = top_items(data["topics"])
+        top_keywords = top_items(data["keywords"])
+        top_verticals = top_items(data["verticals"])
+        label = top_verticals[0] if top_verticals else (top_topics[0] if top_topics else "misc")
+        size = sum(1 for x in labels if x == cid)
+        label_rows.append(
+            (
+                int(cid),
+                vector_type,
+                method,
+                label,
+                ", ".join(top_topics),
+                ", ".join(top_keywords),
+                size,
+            )
+        )
+    conn.executemany(
+        """
+        INSERT INTO creator_cluster_labels (
+            cluster_id, vector_type, method, label, top_topics, top_keywords, size
+        ) VALUES (?, ?, ?, ?, ?, ?, ?)
+        """,
+        label_rows,
+    )
+    conn.commit()
+    print(f"✅ Clustered {len(ids)} creators using {method}.")
+    conn.close()
+    return 0
+
+
+def cluster_export(args: argparse.Namespace) -> int:
+    db_path = Path(args.adl_db)
+    if not db_path.exists():
+        print(f"❌ DB not found: {db_path}", file=sys.stderr)
+        return 1
+    out_path = args.out
+    print_flag = bool(getattr(args, "print_rows", False))
+    if not out_path and not print_flag:
+        print("❌ Provide --out or --print.", file=sys.stderr)
+        return 1
+
+    label = args.label.strip().lower()
+    method = args.method
+    vector_type = args.vector_type
+    require_email = bool(getattr(args, "require_email", False))
+    require_website = bool(getattr(args, "require_website", False))
+
+    conn = sqlite3.connect(db_path, timeout=10)
+    conn.row_factory = sqlite3.Row
+    configure_sqlite(conn)
+    ensure_creator_clusters_table(conn)
+    ensure_creator_cluster_labels_table(conn)
+    ensure_creators_table(conn)
+    ensure_podscan_table(conn)
+    try:
+        where_parts = [
+            "LOWER(l.label) = ?",
+            "l.method = ?",
+            "l.vector_type = ?",
+        ]
+        params = [label, method, vector_type]
+        if require_email:
+            where_parts.append("p.email IS NOT NULL AND TRIM(p.email) <> ''")
+        if require_website:
+            where_parts.append("p.website IS NOT NULL AND TRIM(p.website) <> ''")
+        where_clause = " AND ".join(where_parts)
+
+        rows = conn.execute(
+            f"""
+            SELECT c.podcastindex_id, c.title, p.email, p.website, l.label,
+                   l.top_topics, l.top_keywords, l.size, l.method, l.vector_type
+            FROM creator_clusters cc
+            JOIN creator_cluster_labels l
+              ON l.cluster_id = cc.cluster_id
+             AND l.vector_type = cc.vector_type
+             AND l.method = cc.method
+            JOIN creators c ON c.podcastindex_id = cc.podcastindex_id
+            LEFT JOIN podscan p ON p.podcastindex_id = cc.podcastindex_id
+            WHERE {where_clause}
+            ORDER BY c.podcastindex_id
+            """,
+            params,
+        ).fetchall()
+
+        if not rows:
+            print("No rows matched the requested label/filters.")
+            return 0
+
+        header = [
+            "podcastindex_id",
+            "title",
+            "email",
+            "website",
+            "label",
+            "top_topics",
+            "top_keywords",
+            "cluster_size",
+            "method",
+            "vector_type",
+        ]
+        if out_path:
+            out_path = Path(out_path)
+            out_path.parent.mkdir(parents=True, exist_ok=True)
+            with out_path.open("w", newline="") as f:
+                writer = csv.writer(f)
+                writer.writerow(header)
+                for r in rows:
+                    writer.writerow([r[h] for h in header])
+            print(f"✅ Wrote {len(rows)} rows to {out_path}")
+
+        if print_flag:
+            print(",".join(header))
+            for r in rows:
+                print(",".join("" if r[h] is None else str(r[h]) for h in header))
+        return 0
+    finally:
+        conn.close()
+
+
 def rank_entities(args: argparse.Namespace) -> int:
     db_path = Path(args.adl_db)
     if not db_path.exists():
@@ -5705,6 +6152,11 @@ def parse_args(argv: Optional[Sequence[str]] = None) -> argparse.Namespace:
     embed_entity_parser.add_argument("--limit", type=int, default=100, help="Max rows to embed (default 100)")
     embed_entity_parser.add_argument("--offset", type=int, default=0, help="Offset for bulk mode")
     embed_entity_parser.add_argument(
+        "--podscan",
+        action="store_true",
+        help="Only embed creators that have Podscan JSON",
+    )
+    embed_entity_parser.add_argument(
         "--refreshall",
         action="store_true",
         help="Delete existing embeddings for this entity type before embedding (requires typing YES)",
@@ -5740,6 +6192,17 @@ def parse_args(argv: Optional[Sequence[str]] = None) -> argparse.Namespace:
         "--embedding-model",
         default=LOCAL_OLLAMA_EMBED_MODEL,
         help="Embedding model name (local default: bge-large:335m-en-v1.5-fp16 via OLLAMA_EMBED_MODEL; openai default: text-embedding-3-large)",
+    )
+    embed_entity_parser.add_argument(
+        "--force",
+        action="store_true",
+        help="Re-embed even if embeddings already exist for the entity",
+    )
+    embed_entity_parser.add_argument(
+        "--embedding-mode",
+        choices=["identity", "legacy"],
+        default="identity",
+        help="Embedding text mode (identity uses NAME+SUMMARY+KEYWORDS/TOPICS; legacy uses full per-dimension templates)",
     )
 
     export_parser = subparsers.add_parser("export", help="Export a stored embedding text block to a file")
@@ -5810,14 +6273,125 @@ def parse_args(argv: Optional[Sequence[str]] = None) -> argparse.Namespace:
         help="If set, also write results to CSV (yyyyMMdd-brand{n}.csv or creator{n}.csv)",
     )
 
-    test_compare = subparsers.add_parser("test-compare", help="Compare two text inputs via embeddings")
-    test_compare.add_argument("--text1", help="First text input")
-    test_compare.add_argument("--text2", help="Second text input")
-    test_compare.add_argument("--file1", type=Path, help="Path to first text file")
-    test_compare.add_argument("--file2", type=Path, help="Path to second text file")
-    test_compare.add_argument("--brand-id", type=int, help="Compare using brand embeddings (adlid)")
-    test_compare.add_argument("--creator-id", type=int, help="Compare using creator embeddings (podcastindex_id)")
+    test_compare = subparsers.add_parser("test-compare", help="Compare two entities via stored embeddings")
     test_compare.add_argument(
+        "--entity-1",
+        nargs=2,
+        metavar=("ID", "TYPE"),
+        help="First entity: <id> <brand|creator>",
+    )
+    test_compare.add_argument(
+        "--entity-2",
+        nargs=2,
+        metavar=("ID", "TYPE"),
+        help="Second entity: <id> <brand|creator>",
+    )
+    test_compare.add_argument(
+        "--adl-db",
+        type=Path,
+        default=Path("adelined_matching.db"),
+        help="Path to Adelined SQLite database (default: adelined_matching.db)",
+    )
+
+    compare_creators_parser = subparsers.add_parser("compare-creators", help="Compare two creators via stored embeddings")
+    compare_creators_parser.add_argument(
+        "--creator-id",
+        type=int,
+        required=True,
+        help="First creator podcastindex_id",
+    )
+    compare_creators_parser.add_argument(
+        "--creator-id-2",
+        type=int,
+        required=True,
+        help="Second creator podcastindex_id",
+    )
+    compare_creators_parser.add_argument(
+        "--adl-db",
+        type=Path,
+        default=Path("adelined_matching.db"),
+        help="Path to Adelined SQLite database (default: adelined_matching.db)",
+    )
+
+    cluster_parser = subparsers.add_parser("cluster-creators", help="Cluster creators using embeddings")
+    cluster_parser.add_argument(
+        "--method",
+        choices=["hdbscan", "kmeans"],
+        default="hdbscan",
+        help="Clustering method (default: hdbscan)",
+    )
+    cluster_parser.add_argument(
+        "--vector-type",
+        default="semantic_summary",
+        help="Embedding vector_type to cluster (default: semantic_summary)",
+    )
+    cluster_parser.add_argument(
+        "--min-cluster-size",
+        type=int,
+        default=20,
+        help="HDBSCAN min cluster size (default: 20)",
+    )
+    cluster_parser.add_argument(
+        "--min-samples",
+        type=int,
+        default=5,
+        help="HDBSCAN min samples (default: 5)",
+    )
+    cluster_parser.add_argument(
+        "--suggest-k",
+        action="store_true",
+        help="When using HDBSCAN, print suggested k based on discovered clusters",
+    )
+    cluster_parser.add_argument(
+        "--k",
+        type=int,
+        help="K for k-means (required when --method kmeans)",
+    )
+    cluster_parser.add_argument(
+        "--adl-db",
+        type=Path,
+        default=Path("adelined_matching.db"),
+        help="Path to Adelined SQLite database (default: adelined_matching.db)",
+    )
+
+    cluster_export_parser = subparsers.add_parser("cluster-export", help="Export creators from a labeled cluster")
+    cluster_export_parser.add_argument(
+        "--label",
+        required=True,
+        help="Cluster label to export (case-insensitive)",
+    )
+    cluster_export_parser.add_argument(
+        "--method",
+        default="hdbscan",
+        help="Clustering method name used to build clusters (default: hdbscan)",
+    )
+    cluster_export_parser.add_argument(
+        "--vector-type",
+        default="semantic_summary",
+        help="Vector type used for clustering (default: semantic_summary)",
+    )
+    cluster_export_parser.add_argument(
+        "--require-email",
+        action="store_true",
+        help="Only include rows with an email address",
+    )
+    cluster_export_parser.add_argument(
+        "--require-website",
+        action="store_true",
+        help="Only include rows with a website",
+    )
+    cluster_export_parser.add_argument(
+        "--out",
+        type=Path,
+        help="CSV output path",
+    )
+    cluster_export_parser.add_argument(
+        "--print",
+        dest="print_rows",
+        action="store_true",
+        help="Print CSV rows to stdout",
+    )
+    cluster_export_parser.add_argument(
         "--adl-db",
         type=Path,
         default=Path("adelined_matching.db"),
@@ -6012,6 +6586,12 @@ def main(argv: Optional[Sequence[str]] = None) -> int:
         return rank_entities(args)
     if args.action == "test-compare":
         return test_compare(args)
+    if args.action == "cluster-creators":
+        return cluster_creators(args)
+    if args.action == "cluster-export":
+        return cluster_export(args)
+    if args.action == "compare-creators":
+        return compare_creators(args)
     if args.action == "test-enrich":
         return test_enrich(args)
     if args.action == "export":
