@@ -914,6 +914,134 @@ def show_enrichment(args: argparse.Namespace) -> int:
             except Exception:
                 return {}
 
+        def auto_normalize_creator(podcastindex_id: int, *, use_podscan: bool) -> bool:
+            exists = conn.execute(
+                "SELECT 1 FROM entity_normalized WHERE entity_type='creator' AND entity_id=? AND version='v1'",
+                (podcastindex_id,),
+            ).fetchone()
+            if exists:
+                return False
+            name = f"podcast {podcastindex_id}"
+            fields_parts: List[str] = []
+            if use_podscan:
+                row = conn.execute(
+                    """
+                    SELECT c.title, ps.full_json
+                    FROM creators c
+                    JOIN podscan ps ON ps.podcastindex_id = c.podcastindex_id
+                    WHERE c.podcastindex_id=?
+                      AND ps.full_json IS NOT NULL
+                      AND TRIM(ps.full_json) <> ''
+                    """,
+                    (podcastindex_id,),
+                ).fetchone()
+                if not row:
+                    return False
+                name = row["title"] or name
+                try:
+                    pod = json.loads(row["full_json"])
+                except Exception:
+                    print(f"⚠️ Invalid Podscan JSON for creator {podcastindex_id}; skipping normalization.")
+                    return False
+                desc = pod.get("podcast_description") or ""
+                if pod.get("podcast_name"):
+                    name = pod.get("podcast_name") or name
+                if not desc:
+                    return False
+                fields_parts.append(f"DESCRIPTION: {desc}")
+            else:
+                row = conn.execute(
+                    """
+                    SELECT c.*, ce.cleaned_text_block, ce.raw_text_sources
+                    FROM creators c
+                    LEFT JOIN creator_enrichment ce ON ce.podcastindex_id = c.podcastindex_id
+                    WHERE c.podcastindex_id=?
+                    """,
+                    (podcastindex_id,),
+                ).fetchone()
+                if not row:
+                    return False
+                name = row["title"] or name
+                for key in ["title", "description", "categories", "cleaned_text_block"]:
+                    if row[key]:
+                        fields_parts.append(f"{key.upper()}: {row[key]}")
+                try:
+                    raw_sources = json.loads(row["raw_text_sources"]) if row["raw_text_sources"] else {}
+                except Exception:
+                    raw_sources = {}
+                for k, v in (raw_sources or {}).items():
+                    if v:
+                        fields_parts.append(f"{k.upper()}: {v}")
+            raw_blob = "\n".join(fields_parts)
+            if not raw_blob:
+                return False
+            if len(raw_blob) > 12000:
+                raw_blob = raw_blob[:12000]
+            simplified = simplify_entity_text("creator", name, raw_blob, norm_provider, ollama_model) or raw_blob
+            fields_text = f"SIMPLIFIED:\n{simplified}\n\nRAW:\n{raw_blob}"
+            debug_tag = f"creator:{podcastindex_id}"
+            norm = normalize_entity_to_json(
+                "creator",
+                name,
+                fields_text,
+                categories_hint,
+                provider=norm_provider,
+                model=ollama_model,
+                debug_tag=debug_tag,
+            )
+            if not norm or not norm.get("summary"):
+                return False
+            for key in ["vertical", "audience", "themes", "use_cases", "pain_points", "tone", "geo"]:
+                norm[key] = map_label_from_lexicon(conn, norm.get(key))
+            topics_val = norm.get("topics")
+            topics_str = map_topics_to_apple(conn, topics_val)
+            block_parts = [
+                f"SUMMARY:\n{norm.get('summary','')}",
+                f"VERTICAL:\n{norm.get('vertical','')}",
+                f"AUDIENCE:\n{norm.get('audience','')}",
+                f"PAIN_POINTS:\n{norm.get('pain_points','')}",
+                f"USE_CASES:\n{norm.get('use_cases','')}",
+                f"THEMES:\n{norm.get('themes','')}",
+                f"TONE:\n{norm.get('tone','')}",
+                f"GEO:\n{norm.get('geo','')}",
+                f"TOPICS:\n{topics_str}",
+            ]
+            normalized_block = "\n".join(block_parts)
+            conn.execute(
+                """
+                INSERT OR REPLACE INTO entity_normalized (entity_type, entity_id, version, normalized_block, norm_fields)
+                VALUES ('creator', ?, 'v1', ?, ?)
+                """,
+                (podcastindex_id, normalized_block, json.dumps(norm)),
+            )
+            def to_str(val):
+                if val is None:
+                    return None
+                if isinstance(val, list):
+                    return ", ".join(str(x) for x in val if x)
+                return str(val)
+            conn.execute(
+                """
+                UPDATE creators SET
+                    normalized_summary=?, normalized_vertical=?, normalized_audience=?, normalized_pain_points=?,
+                    normalized_use_cases=?, normalized_themes=?, normalized_tone=?, normalized_geo=?, normalized_topics=?
+                WHERE podcastindex_id=?
+                """,
+                (
+                    to_str(norm.get("summary")),
+                    to_str(norm.get("vertical")),
+                    to_str(norm.get("audience")),
+                    to_str(norm.get("pain_points")),
+                    to_str(norm.get("use_cases")),
+                    to_str(norm.get("themes")),
+                    to_str(norm.get("tone")),
+                    to_str(norm.get("geo")),
+                    to_str(topics_str),
+                    podcastindex_id,
+                ),
+            )
+            return True
+
         def count_nonempty(d: Dict) -> int:
             if not isinstance(d, dict):
                 return 0
@@ -1860,15 +1988,19 @@ def enrich_creators(args: argparse.Namespace) -> int:
     if not db_path.exists():
         print(f"❌ DB not found: {db_path}", file=sys.stderr)
         return 1
+    from_podscan = bool(getattr(args, "from_podscan", False))
 
     have_spotify = bool(os.getenv("SPOTIFY_CLIENT_ID") and os.getenv("SPOTIFY_CLIENT_SECRET"))
     have_youtube = bool(os.getenv("YOUTUBE_API_KEY"))
-    if not have_spotify:
-        print("❌ SPOTIFY_CLIENT_ID/SECRET not set; enrichment requires Spotify API.", file=sys.stderr)
-        return 1
-    if not have_youtube:
-        print("❌ YOUTUBE_API_KEY not set; enrichment requires YouTube API.", file=sys.stderr)
-        return 1
+    if not from_podscan:
+        if not have_spotify:
+            print("❌ SPOTIFY_CLIENT_ID/SECRET not set; enrichment requires Spotify API.", file=sys.stderr)
+            return 1
+        if not have_youtube:
+            print("❌ YOUTUBE_API_KEY not set; enrichment requires YouTube API.", file=sys.stderr)
+            return 1
+    if from_podscan and args.sources:
+        print("⚠️ --sources ignored when --from-podscan is set.")
 
     conn = sqlite3.connect(db_path, timeout=10)
     conn.row_factory = sqlite3.Row
@@ -1877,6 +2009,8 @@ def enrich_creators(args: argparse.Namespace) -> int:
         ensure_podcastindex_tables(conn)
         ensure_creators_table(conn)
         ensure_creator_enrichment_table(conn)
+        if from_podscan:
+            ensure_podscan_table(conn)
         ensure_column(conn, "creator_enrichment", "source_social_twitter", "TEXT")
         ensure_column(conn, "creator_enrichment", "source_social_instagram", "TEXT")
         ensure_column(conn, "creator_enrichment", "source_social_website", "TEXT")
@@ -1892,28 +2026,50 @@ def enrich_creators(args: argparse.Namespace) -> int:
             ensure_column(conn, "creators", col[0], col[1])
 
         requested_sources = None
-        if args.sources:
+        if args.sources and not from_podscan:
             requested_sources = {s.strip().lower() for s in args.sources.split(",") if s.strip()}
             print(f"🔎 Enriching only requested sources: {', '.join(sorted(requested_sources))}")
             print("   Will prioritize rows with missing/error/not_found for those sources.")
         disabled_sources = set()
+        auto_norm = bool(getattr(args, "auto_norm", False))
+        norm_provider = "local"
+        ollama_model = LOCAL_OLLAMA_MODEL
+        categories_hint = ""
+        if auto_norm:
+            ensure_entity_normalized_table(conn)
+            ensure_normalization_lexicon_table(conn)
+            ensure_apple_categories_table(conn)
+            cat_rows = conn.execute(
+                "SELECT full_path FROM apple_podcast_categories LIMIT 30"
+            ).fetchall()
+            categories_hint = "\n".join([r["full_path"] for r in cat_rows]) if cat_rows else ""
 
         cursor = conn.cursor()
         pidrange = args.pidrange
+        podscan_select = ", ps.full_json as podscan_json" if from_podscan else ""
+        podscan_join = (
+            "JOIN podscan ps ON ps.podcastindex_id = c.podcastindex_id "
+            "AND ps.full_json IS NOT NULL AND TRIM(ps.full_json) <> ''"
+            if from_podscan
+            else ""
+        )
 
         if args.only_id:
             cursor.execute(
-                """
+                f"""
                 SELECT c.podcastindex_id, c.itunesid, c.language,
                        p.url as feed_url, p.link as web_link, p.title as pi_title, p.description as pi_description,
                        p.category1, p.category2, p.category3, p.category4, p.category5,
                        p.category6, p.category7, p.category8, p.category9, p.category10,
                        p.podcastGuid,
+                       ce.podcastindex_id as ce_pid,
                        ce.source_spotify, ce.source_apple, ce.source_youtube,
                        ce.source_social_twitter, ce.source_social_instagram, ce.source_social_website, ce.source_social_patreon
+                       {podscan_select}
                 FROM creators c
                 LEFT JOIN podcastindex_feeds p ON c.podcastindex_id = p.id
                 LEFT JOIN creator_enrichment ce ON ce.podcastindex_id = c.podcastindex_id
+                {podscan_join}
                 WHERE c.podcastindex_id = ?
                 """,
                 (args.only_id,),
@@ -1930,11 +2086,14 @@ def enrich_creators(args: argparse.Namespace) -> int:
                        p.category1, p.category2, p.category3, p.category4, p.category5,
                        p.category6, p.category7, p.category8, p.category9, p.category10,
                        p.podcastGuid,
+                       ce.podcastindex_id as ce_pid,
                        ce.source_spotify, ce.source_apple, ce.source_youtube,
                        ce.source_social_twitter, ce.source_social_instagram, ce.source_social_website, ce.source_social_patreon
+                       {podscan_select}
                 FROM creators c
                 LEFT JOIN podcastindex_feeds p ON c.podcastindex_id = p.id
                 LEFT JOIN creator_enrichment ce ON ce.podcastindex_id = c.podcastindex_id
+                {podscan_join}
                 {range_clause}
                 ORDER BY
                     p.newestItemPubdate DESC NULLS LAST,
@@ -1942,22 +2101,144 @@ def enrich_creators(args: argparse.Namespace) -> int:
                     COALESCE(p.updateFrequency, 999999) ASC
                 LIMIT ? OFFSET ?
             """
-            params.extend([args.limit * 5, args.offset])
-            cursor.execute(
-                query,
-                params,
-            )
+            base_params = list(params)
 
-        raw_rows = cursor.fetchall()
-        if not raw_rows:
-            print("No creators to enrich.")
-            return 0
+        target_limit = args.limit if args.limit and args.limit > 0 else None
+        batch_size = max(target_limit or 100, 100)
 
         def load_json(val):
             try:
                 return json.loads(val) if val else {}
             except Exception:
                 return {}
+
+        def auto_normalize_creator(podcastindex_id: int, *, use_podscan: bool) -> bool:
+            exists = conn.execute(
+                "SELECT 1 FROM entity_normalized WHERE entity_type='creator' AND entity_id=? AND version='v1'",
+                (podcastindex_id,),
+            ).fetchone()
+            if exists:
+                return False
+            name = f"podcast {podcastindex_id}"
+            fields_parts: List[str] = []
+            if use_podscan:
+                row = conn.execute(
+                    """
+                    SELECT c.title, ps.full_json
+                    FROM creators c
+                    JOIN podscan ps ON ps.podcastindex_id = c.podcastindex_id
+                    WHERE c.podcastindex_id=?
+                      AND ps.full_json IS NOT NULL
+                      AND TRIM(ps.full_json) <> ''
+                    """,
+                    (podcastindex_id,),
+                ).fetchone()
+                if not row:
+                    return False
+                name = row["title"] or name
+                try:
+                    pod = json.loads(row["full_json"])
+                except Exception:
+                    print(f"⚠️ Invalid Podscan JSON for creator {podcastindex_id}; skipping normalization.")
+                    return False
+                desc = pod.get("podcast_description") or ""
+                if pod.get("podcast_name"):
+                    name = pod.get("podcast_name") or name
+                if not desc:
+                    return False
+                fields_parts.append(f"DESCRIPTION: {desc}")
+            else:
+                row = conn.execute(
+                    """
+                    SELECT c.*, ce.cleaned_text_block, ce.raw_text_sources
+                    FROM creators c
+                    LEFT JOIN creator_enrichment ce ON ce.podcastindex_id = c.podcastindex_id
+                    WHERE c.podcastindex_id=?
+                    """,
+                    (podcastindex_id,),
+                ).fetchone()
+                if not row:
+                    return False
+                name = row["title"] or name
+                for key in ["title", "description", "categories", "cleaned_text_block"]:
+                    if row[key]:
+                        fields_parts.append(f"{key.upper()}: {row[key]}")
+                try:
+                    raw_sources = json.loads(row["raw_text_sources"]) if row["raw_text_sources"] else {}
+                except Exception:
+                    raw_sources = {}
+                for k, v in (raw_sources or {}).items():
+                    if v:
+                        fields_parts.append(f"{k.upper()}: {v}")
+            raw_blob = "\n".join(fields_parts)
+            if not raw_blob:
+                return False
+            if len(raw_blob) > 12000:
+                raw_blob = raw_blob[:12000]
+            simplified = simplify_entity_text("creator", name, raw_blob, norm_provider, ollama_model) or raw_blob
+            fields_text = f"SIMPLIFIED:\n{simplified}\n\nRAW:\n{raw_blob}"
+            debug_tag = f"creator:{podcastindex_id}"
+            norm = normalize_entity_to_json(
+                "creator",
+                name,
+                fields_text,
+                categories_hint,
+                provider=norm_provider,
+                model=ollama_model,
+                debug_tag=debug_tag,
+            )
+            if not norm or not norm.get("summary"):
+                return False
+            for key in ["vertical", "audience", "themes", "use_cases", "pain_points", "tone", "geo"]:
+                norm[key] = map_label_from_lexicon(conn, norm.get(key))
+            topics_val = norm.get("topics")
+            topics_str = map_topics_to_apple(conn, topics_val)
+            block_parts = [
+                f"SUMMARY:\n{norm.get('summary','')}",
+                f"VERTICAL:\n{norm.get('vertical','')}",
+                f"AUDIENCE:\n{norm.get('audience','')}",
+                f"PAIN_POINTS:\n{norm.get('pain_points','')}",
+                f"USE_CASES:\n{norm.get('use_cases','')}",
+                f"THEMES:\n{norm.get('themes','')}",
+                f"TONE:\n{norm.get('tone','')}",
+                f"GEO:\n{norm.get('geo','')}",
+                f"TOPICS:\n{topics_str}",
+            ]
+            normalized_block = "\n".join(block_parts)
+            conn.execute(
+                """
+                INSERT OR REPLACE INTO entity_normalized (entity_type, entity_id, version, normalized_block, norm_fields)
+                VALUES ('creator', ?, 'v1', ?, ?)
+                """,
+                (podcastindex_id, normalized_block, json.dumps(norm)),
+            )
+            def to_str(val):
+                if val is None:
+                    return None
+                if isinstance(val, list):
+                    return ", ".join(str(x) for x in val if x)
+                return str(val)
+            conn.execute(
+                """
+                UPDATE creators SET
+                    normalized_summary=?, normalized_vertical=?, normalized_audience=?, normalized_pain_points=?,
+                    normalized_use_cases=?, normalized_themes=?, normalized_tone=?, normalized_geo=?, normalized_topics=?
+                WHERE podcastindex_id=?
+                """,
+                (
+                    to_str(norm.get("summary")),
+                    to_str(norm.get("vertical")),
+                    to_str(norm.get("audience")),
+                    to_str(norm.get("pain_points")),
+                    to_str(norm.get("use_cases")),
+                    to_str(norm.get("themes")),
+                    to_str(norm.get("tone")),
+                    to_str(norm.get("geo")),
+                    to_str(topics_str),
+                    podcastindex_id,
+                ),
+            )
+            return True
 
         def needs_source_refresh(source_name: str, existing: Dict) -> bool:
             if requested_sources and source_name not in requested_sources:
@@ -1967,79 +2248,92 @@ def enrich_creators(args: argparse.Namespace) -> int:
                 return True
             return False
 
-        rows = []
-        for r in raw_rows:
-            existing_spotify = load_json(r["source_spotify"])
-            existing_apple = load_json(r["source_apple"])
-            existing_youtube = load_json(r["source_youtube"])
-            existing_social = {
-                "twitter": load_json(r["source_social_twitter"]),
-                "instagram": load_json(r["source_social_instagram"]),
-                "website": load_json(r["source_social_website"]),
-                "patreon": load_json(r["source_social_patreon"]),
-            }
-            ce_missing = (
-                r["source_spotify"] is None
-                and r["source_apple"] is None
-                and r["source_youtube"] is None
-                and r["source_social_twitter"] is None
-                and r["source_social_instagram"] is None
-                and r["source_social_website"] is None
-                and r["source_social_patreon"] is None
-            )
+        def select_candidates(raw_rows: List[sqlite3.Row]) -> List[sqlite3.Row]:
+            rows = []
+            for r in raw_rows:
+                existing_spotify = load_json(r["source_spotify"])
+                existing_apple = load_json(r["source_apple"])
+                existing_youtube = load_json(r["source_youtube"])
+                existing_social = {
+                    "twitter": load_json(r["source_social_twitter"]),
+                    "instagram": load_json(r["source_social_instagram"]),
+                    "website": load_json(r["source_social_website"]),
+                    "patreon": load_json(r["source_social_patreon"]),
+                }
+                ce_missing = (
+                    r["source_spotify"] is None
+                    and r["source_apple"] is None
+                    and r["source_youtube"] is None
+                    and r["source_social_twitter"] is None
+                    and r["source_social_instagram"] is None
+                    and r["source_social_website"] is None
+                    and r["source_social_patreon"] is None
+                )
 
-            all_social_keys = {"twitter", "instagram", "website", "patreon"}
-            if requested_sources:
-                if "social" in requested_sources:
-                    requested_social_keys = all_social_keys
+                all_social_keys = {"twitter", "instagram", "website", "patreon"}
+                if requested_sources:
+                    if "social" in requested_sources:
+                        requested_social_keys = all_social_keys
+                    else:
+                        requested_social_keys = {s for s in requested_sources if s in all_social_keys}
                 else:
-                    requested_social_keys = {s for s in requested_sources if s in all_social_keys}
-            else:
-                requested_social_keys = all_social_keys
+                    requested_social_keys = all_social_keys
 
-            def social_needs_refresh() -> bool:
-                for key in requested_social_keys:
-                    val = existing_social.get(key)
-                    if not val:
-                        return True
-                    if isinstance(val, dict) and len(val.keys()) == 0:
-                        return True
-                return False
+                def social_needs_refresh() -> bool:
+                    for key in requested_social_keys:
+                        val = existing_social.get(key)
+                        if not val:
+                            return True
+                        if isinstance(val, dict) and len(val.keys()) == 0:
+                            return True
+                    return False
 
-            if not requested_sources:
-                refresh_needed = ce_missing or any(
-                    needs_source_refresh(src_name, existing)
+                if from_podscan:
+                    if r["ce_pid"] is None:
+                        rows.append(r)
+                    continue
+                if not requested_sources:
+                    refresh_needed = ce_missing or any(
+                        needs_source_refresh(src_name, existing)
+                        for src_name, existing in [
+                            ("spotify", existing_spotify),
+                            ("apple", existing_apple),
+                            ("youtube", existing_youtube),
+                        ]
+                    )
+                    if not refresh_needed:
+                        refresh_needed = social_needs_refresh()
+                    if refresh_needed:
+                        rows.append(r)
+                else:
+                    refresh_needed = False
                     for src_name, existing in [
                         ("spotify", existing_spotify),
                         ("apple", existing_apple),
                         ("youtube", existing_youtube),
-                    ]
-                )
-                if not refresh_needed:
-                    refresh_needed = social_needs_refresh()
-                if refresh_needed:
-                    rows.append(r)
-            else:
-                refresh_needed = False
-                for src_name, existing in [
-                    ("spotify", existing_spotify),
-                    ("apple", existing_apple),
-                    ("youtube", existing_youtube),
-                ]:
-                    if src_name in requested_sources and needs_source_refresh(src_name, existing):
-                        refresh_needed = True
-                        break
-                if not refresh_needed and requested_social_keys:
-                    refresh_needed = social_needs_refresh()
-                if refresh_needed or ce_missing:
-                    rows.append(r)
+                    ]:
+                        if src_name in requested_sources and needs_source_refresh(src_name, existing):
+                            refresh_needed = True
+                            break
+                    if not refresh_needed and requested_social_keys:
+                        refresh_needed = social_needs_refresh()
+                    if refresh_needed or ce_missing:
+                        rows.append(r)
+            return rows
 
-        if not rows:
-            print("No creators to enrich for the requested sources.")
-            return 0
-        print(f"🔁 Will process {len(rows)} creators (including missing/error/not_found for requested sources).")
+        if target_limit:
+            print(
+                "🔁 Will process up to {} creators (including missing/error/not_found for requested sources).".format(
+                    target_limit
+                )
+            )
+        else:
+            print("🔁 Will process creators (including missing/error/not_found for requested sources).")
 
         enriched_rows = 0
+        attempted_rows = 0
+        had_candidates = False
+        total_label = str(target_limit) if target_limit else "?"
         stats = {
             "spotify_ok": 0,
             "spotify_missing": 0,
@@ -2050,190 +2344,319 @@ def enrich_creators(args: argparse.Namespace) -> int:
             "apple_ok": 0,
             "apple_not_found": 0,
         }
-        for idx, row in enumerate(rows, start=1):
-            podcastindex_id = row["podcastindex_id"]
-            itunes_id = row["itunesid"]
-            language = (row["language"] or "").lower()
-            if language and "en" not in language:
-                continue
-            base = dict(row)
-            # Use feed URL to guess spotify URL if it matches open.spotify.com/show/...
-            spotify_url = base.get("feed_url") if base.get("feed_url", "").startswith("https://open.spotify.com/show/") else None
+        def process_candidates(candidate_rows: List[sqlite3.Row]) -> bool:
+            nonlocal enriched_rows, attempted_rows
+            for row in candidate_rows:
+                if target_limit and enriched_rows >= target_limit:
+                    return True
+                podcastindex_id = row["podcastindex_id"]
+                itunes_id = row["itunesid"]
+                language = (row["language"] or "").lower()
+                if language and "en" not in language:
+                    continue
+                attempted_rows += 1
+                base = dict(row)
+                # Use feed URL to guess spotify URL if it matches open.spotify.com/show/...
+                spotify_url = base.get("feed_url") if base.get("feed_url", "").startswith("https://open.spotify.com/show/") else None
 
-            title_for_lookup = base.get("pi_title") or ""
+                title_for_lookup = base.get("pi_title") or ""
 
-            existing_spotify = load_json(row["source_spotify"])
-            existing_apple = load_json(row["source_apple"])
-            existing_youtube = load_json(row["source_youtube"])
-            existing_social = {
-                "twitter": load_json(row["source_social_twitter"]),
-                "instagram": load_json(row["source_social_instagram"]),
-                "website": load_json(row["source_social_website"]),
-                "patreon": load_json(row["source_social_patreon"]),
-            }
+                existing_spotify = load_json(row["source_spotify"])
+                existing_apple = load_json(row["source_apple"])
+                existing_youtube = load_json(row["source_youtube"])
+                existing_social = {
+                    "twitter": load_json(row["source_social_twitter"]),
+                    "instagram": load_json(row["source_social_instagram"]),
+                    "website": load_json(row["source_social_website"]),
+                    "patreon": load_json(row["source_social_patreon"]),
+                }
+                if from_podscan:
+                    podscan_json = row["podscan_json"]
+                    if not podscan_json:
+                        continue
+                    try:
+                        pod = json.loads(podscan_json)
+                    except Exception:
+                        print(f"⚠️ Invalid Podscan JSON for creator {podcastindex_id}; skipping.")
+                        continue
+                    pod_name = (
+                        pod.get("podcast_name")
+                        or pod.get("podcast_title")
+                        or pod.get("title")
+                        or pod.get("name")
+                        or ""
+                    )
+                    pod_desc = (
+                        pod.get("podcast_description")
+                        or pod.get("description")
+                        or pod.get("summary")
+                        or ""
+                    )
+                    combined_raw = "\n\n".join([v for v in [pod_name, pod_desc] if v]).strip()
+                    if not combined_raw:
+                        continue
+                    base["pi_title"] = pod_name or base.get("pi_title") or ""
+                    base["pi_description"] = pod_desc or base.get("pi_description") or ""
+                    cleaned_text, raw_sources = build_text_block(
+                        base=base,
+                        apple={},
+                        spotify={},
+                        youtube={},
+                        social={},
+                        extracted=extract_creator_metadata(combined_raw),
+                    )
+                    raw_sources["podscan_name"] = pod_name
+                    raw_sources["podscan_description"] = pod_desc
+                    uk_score = compute_uk_score(base, {}, {}, {}, {})
+                    conn.execute(
+                        """
+                        INSERT OR REPLACE INTO creator_enrichment (
+                            podcastindex_id, uk_score, source_spotify, source_apple, source_youtube,
+                            source_social_twitter, source_social_instagram, source_social_website, source_social_patreon,
+                            cleaned_text_block, raw_text_sources, updated_at
+                        ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, CURRENT_TIMESTAMP)
+                        """,
+                        (
+                            podcastindex_id,
+                            uk_score,
+                            None,
+                            None,
+                            None,
+                            None,
+                            None,
+                            None,
+                            None,
+                            cleaned_text,
+                            json.dumps(raw_sources),
+                        ),
+                    )
+                    extracted = raw_sources.get("extracted_metadata") or {}
+                    if extracted:
+                        conn.execute(
+                            """
+                            UPDATE creators
+                            SET vertical = ?, audience_profile = ?, industry_keywords = ?, business_functions = ?, pain_points = ?, geo_focus = ?
+                            WHERE podcastindex_id = ?
+                            """,
+                            (
+                                extracted.get("vertical"),
+                                extracted.get("audience_profile"),
+                                extracted.get("industry_keywords"),
+                                extracted.get("business_functions"),
+                                extracted.get("pain_points"),
+                                extracted.get("geo_focus"),
+                                podcastindex_id,
+                            ),
+                        )
+                    if auto_norm:
+                        auto_normalize_creator(podcastindex_id, use_podscan=True)
+                    enriched_rows += 1
+                    if enriched_rows % 10 == 0:
+                        conn.commit()
+                        print(
+                            f"Enriched {enriched_rows}/{total_label} (last podcastindex_id={podcastindex_id})"
+                        )
+                    continue
 
-            fetch_spotify_flag = ((not requested_sources) or ("spotify" in requested_sources)) and ("spotify" not in disabled_sources)
-            fetch_apple_flag = ((not requested_sources) or ("apple" in requested_sources)) and ("apple" not in disabled_sources)
-            fetch_youtube_flag = ((not requested_sources) or ("youtube" in requested_sources)) and ("youtube" not in disabled_sources)
-            social_requested = (not requested_sources) or ("social" in requested_sources) or any(
-                s in requested_sources for s in ["twitter", "instagram", "website", "patreon"]
-            )
-            fetch_social_flag = social_requested and ("social" not in disabled_sources)
+                fetch_spotify_flag = ((not requested_sources) or ("spotify" in requested_sources)) and ("spotify" not in disabled_sources)
+                fetch_apple_flag = ((not requested_sources) or ("apple" in requested_sources)) and ("apple" not in disabled_sources)
+                fetch_youtube_flag = ((not requested_sources) or ("youtube" in requested_sources)) and ("youtube" not in disabled_sources)
+                social_requested = (not requested_sources) or ("social" in requested_sources) or any(
+                    s in requested_sources for s in ["twitter", "instagram", "website", "patreon"]
+                )
+                fetch_social_flag = social_requested and ("social" not in disabled_sources)
 
-            spotify_fetched = fetch_spotify_flag
-            youtube_fetched = fetch_youtube_flag
-            if idx % 5 == 1 or idx == 1:
-                print(f"[{idx}/{len(rows)}] pid={podcastindex_id} fetching sources…", end="\r")
-            spotify_meta = existing_spotify if not fetch_spotify_flag else fetch_spotify_metadata(spotify_url, title_for_lookup)
-            apple_meta = existing_apple if not fetch_apple_flag else fetch_apple_metadata(itunes_id, title_for_lookup)
-            youtube_meta = existing_youtube if not fetch_youtube_flag else fetch_youtube_metadata(title_for_lookup, mode="lean")
-            social_meta = existing_social if not fetch_social_flag else fetch_social_bios_from_sources(base, apple_meta, spotify_meta, youtube_meta)
+                spotify_fetched = fetch_spotify_flag
+                youtube_fetched = fetch_youtube_flag
+                if attempted_rows % 5 == 1 or attempted_rows == 1:
+                    print(f"[{attempted_rows}/{total_label}] pid={podcastindex_id} fetching sources…", end="\r")
+                spotify_meta = existing_spotify if not fetch_spotify_flag else fetch_spotify_metadata(spotify_url, title_for_lookup)
+                apple_meta = existing_apple if not fetch_apple_flag else fetch_apple_metadata(itunes_id, title_for_lookup)
+                youtube_meta = existing_youtube if not fetch_youtube_flag else fetch_youtube_metadata(title_for_lookup, mode="lean")
+                social_meta = existing_social if not fetch_social_flag else fetch_social_bios_from_sources(base, apple_meta, spotify_meta, youtube_meta)
 
-            # Stop on 403 errors for any source
-            def is_403(meta: Dict) -> bool:
-                if not isinstance(meta, dict):
+                # Stop on 403 errors for any source
+                def is_403(meta: Dict) -> bool:
+                    if not isinstance(meta, dict):
+                        return False
+                    if meta.get("http_status") == 403:
+                        return True
+                    detail = meta.get("detail")
+                    if isinstance(detail, str) and "quotaExceeded" in detail:
+                        return True
+                    if isinstance(detail, dict) and meta.get("detail", {}).get("error", {}).get("errors"):
+                        # Inspect nested error reasons for quotaExceeded
+                        for err in meta["detail"]["error"]["errors"]:
+                            if err.get("reason") == "quotaExceeded":
+                                return True
                     return False
-                if meta.get("http_status") == 403:
-                    return True
-                detail = meta.get("detail")
-                if isinstance(detail, str) and "quotaExceeded" in detail:
-                    return True
-                if isinstance(detail, dict) and meta.get("detail", {}).get("error", {}).get("errors"):
-                    # Inspect nested error reasons for quotaExceeded
-                    for err in meta["detail"]["error"]["errors"]:
-                        if err.get("reason") == "quotaExceeded":
-                            return True
-                return False
 
-            if spotify_fetched and is_403(spotify_meta):
-                if requested_sources and "spotify" in requested_sources:
-                    print(f"STOP: Spotify returned 403 for podcastindex_id={podcastindex_id}. Detail: {spotify_meta.get('detail')}")
-                    print("\033[31mEnrichment halted due to Spotify 403 (likely quota or key restriction).\033[0m")
-                    conn.rollback()
-                    return 1
+                if spotify_fetched and is_403(spotify_meta):
+                    if requested_sources and "spotify" in requested_sources:
+                        print(f"STOP: Spotify returned 403 for podcastindex_id={podcastindex_id}. Detail: {spotify_meta.get('detail')}")
+                        print("\033[31mEnrichment halted due to Spotify 403 (likely quota or key restriction).\033[0m")
+                        conn.rollback()
+                        return 1
+                    else:
+                        print(f"⚠️ Spotify 403 encountered for podcastindex_id={podcastindex_id}. Skipping further Spotify calls this run.")
+                        print("\033[31mSkipping Spotify due to 403 (likely quota or key restriction).\033[0m")
+                        disabled_sources.add("spotify")
+                        spotify_meta = {"status": "error", "http_status": 403, "detail": spotify_meta.get("detail")}
+                if youtube_fetched and is_403(youtube_meta):
+                    if requested_sources and "youtube" in requested_sources:
+                        print(f"STOP: YouTube returned 403 for podcastindex_id={podcastindex_id}. Detail: {youtube_meta.get('detail')}")
+                        print("\033[31mEnrichment halted due to YouTube 403 (likely quota or API key restriction).\033[0m")
+                        conn.rollback()
+                        return 1
+                    else:
+                        print(f"⚠️ YouTube 403 encountered for podcastindex_id={podcastindex_id}. Skipping further YouTube calls this run.")
+                        print("\033[31mSkipping YouTube due to 403 (likely quota or key restriction).\033[0m")
+                        disabled_sources.add("youtube")
+                        youtube_meta = {"status": "error", "http_status": 403, "detail": youtube_meta.get("detail")}
+
+                # Stats
+                apple_status = apple_meta.get("status") or ("ok" if apple_meta else "not_found")
+                spotify_status = spotify_meta.get("status") or ("ok" if spotify_meta else "not_found")
+                youtube_status = youtube_meta.get("status") or ("ok" if youtube_meta else "not_found")
+                if apple_status == "ok":
+                    stats["apple_ok"] += 1
                 else:
-                    print(f"⚠️ Spotify 403 encountered for podcastindex_id={podcastindex_id}. Skipping further Spotify calls this run.")
-                    print("\033[31mSkipping Spotify due to 403 (likely quota or key restriction).\033[0m")
-                    disabled_sources.add("spotify")
-                    spotify_meta = {"status": "error", "http_status": 403, "detail": spotify_meta.get("detail")}
-            if youtube_fetched and is_403(youtube_meta):
-                if requested_sources and "youtube" in requested_sources:
-                    print(f"STOP: YouTube returned 403 for podcastindex_id={podcastindex_id}. Detail: {youtube_meta.get('detail')}")
-                    print("\033[31mEnrichment halted due to YouTube 403 (likely quota or API key restriction).\033[0m")
-                    conn.rollback()
-                    return 1
+                    stats["apple_not_found"] += 1
+                if spotify_status == "ok":
+                    stats["spotify_ok"] += 1
+                elif spotify_status == "missing_credentials":
+                    stats["spotify_missing"] += 1
                 else:
-                    print(f"⚠️ YouTube 403 encountered for podcastindex_id={podcastindex_id}. Skipping further YouTube calls this run.")
-                    print("\033[31mSkipping YouTube due to 403 (likely quota or API key restriction).\033[0m")
-                    disabled_sources.add("youtube")
-                    youtube_meta = {"status": "error", "http_status": 403, "detail": youtube_meta.get("detail")}
+                    stats["spotify_not_found"] += 1
+                if youtube_status == "ok":
+                    stats["youtube_ok"] += 1
+                elif youtube_status == "missing_credentials":
+                    stats["youtube_missing"] += 1
+                else:
+                    stats["youtube_not_found"] += 1
 
-            # Stats
-            apple_status = apple_meta.get("status") or ("ok" if apple_meta else "not_found")
-            spotify_status = spotify_meta.get("status") or ("ok" if spotify_meta else "not_found")
-            youtube_status = youtube_meta.get("status") or ("ok" if youtube_meta else "not_found")
-            if apple_status == "ok":
-                stats["apple_ok"] += 1
-            else:
-                stats["apple_not_found"] += 1
-            if spotify_status == "ok":
-                stats["spotify_ok"] += 1
-            elif spotify_status == "missing_credentials":
-                stats["spotify_missing"] += 1
-            else:
-                stats["spotify_not_found"] += 1
-            if youtube_status == "ok":
-                stats["youtube_ok"] += 1
-            elif youtube_status == "missing_credentials":
-                stats["youtube_missing"] += 1
-            else:
-                stats["youtube_not_found"] += 1
+                # Build combined raw text for metadata extraction
+                raw_pieces = []
+                for val in [
+                    base.get("pi_description"),
+                    apple_meta.get("description"),
+                    (spotify_meta.get("show", {}) if spotify_meta else {}).get("description"),
+                    (youtube_meta.get("channel", {}) if youtube_meta else {}).get("about"),
+                    (social_meta.get("website") or {}).get("about") if social_meta else None,
+                ]:
+                    if val:
+                        raw_pieces.append(val)
+                # Episode titles for extra signal
+                if spotify_meta.get("episodes_sample"):
+                    ep_titles = [ep.get("name") or "" for ep in spotify_meta["episodes_sample"] if ep]
+                    raw_pieces.append("; ".join(ep_titles[:30]))
+                combined_raw = "\n\n".join(raw_pieces) if raw_pieces else ""
 
-            # Build combined raw text for metadata extraction
-            raw_pieces = []
-            for val in [
-                base.get("pi_description"),
-                apple_meta.get("description"),
-                (spotify_meta.get("show", {}) if spotify_meta else {}).get("description"),
-                (youtube_meta.get("channel", {}) if youtube_meta else {}).get("about"),
-                (social_meta.get("website") or {}).get("about") if social_meta else None,
-            ]:
-                if val:
-                    raw_pieces.append(val)
-            # Episode titles for extra signal
-            if spotify_meta.get("episodes_sample"):
-                ep_titles = [ep.get("name") or "" for ep in spotify_meta["episodes_sample"] if ep]
-                raw_pieces.append("; ".join(ep_titles[:30]))
-            combined_raw = "\n\n".join(raw_pieces) if raw_pieces else ""
+                if attempted_rows % 5 == 1 or attempted_rows == 1:
+                    print(f"[{attempted_rows}/{total_label}] pid={podcastindex_id} running GPT extract…", end="\r")
+                cleaned_text, raw_sources = build_text_block(
+                    base=base,
+                    apple=apple_meta,
+                    spotify=spotify_meta,
+                    youtube=youtube_meta,
+                    social=social_meta,
+                    extracted=extract_creator_metadata(combined_raw) if combined_raw else {},
+                )
 
-            if idx % 5 == 1 or idx == 1:
-                print(f"[{idx}/{len(rows)}] pid={podcastindex_id} running GPT extract…", end="\r")
-            cleaned_text, raw_sources = build_text_block(
-                base=base,
-                apple=apple_meta,
-                spotify=spotify_meta,
-                youtube=youtube_meta,
-                social=social_meta,
-                extracted=extract_creator_metadata(combined_raw) if combined_raw else {},
-            )
+                uk_score = compute_uk_score(base, apple_meta, spotify_meta, youtube_meta, social_meta)
 
-            uk_score = compute_uk_score(base, apple_meta, spotify_meta, youtube_meta, social_meta)
-
-            conn.execute(
-                """
-                INSERT OR REPLACE INTO creator_enrichment (
-                    podcastindex_id, uk_score, source_spotify, source_apple, source_youtube,
-                    source_social_twitter, source_social_instagram, source_social_website, source_social_patreon,
-                    cleaned_text_block, raw_text_sources, updated_at
-                ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, CURRENT_TIMESTAMP)
-                """,
-                (
-                    podcastindex_id,
-                    uk_score,
-                    json.dumps(spotify_meta),
-                    json.dumps(apple_meta),
-                    json.dumps(youtube_meta),
-                    json.dumps(social_meta.get("twitter")) if social_meta.get("twitter") else None,
-                    json.dumps(social_meta.get("instagram")) if social_meta.get("instagram") else None,
-                    json.dumps(social_meta.get("website")) if social_meta.get("website") else None,
-                    json.dumps(social_meta.get("patreon")) if social_meta.get("patreon") else None,
-                    cleaned_text,
-                    json.dumps(raw_sources),
-                ),
-            )
-            # Persist structured creator metadata onto creators table
-            extracted = raw_sources.get("extracted_metadata") or {}
-            if extracted:
                 conn.execute(
                     """
-                    UPDATE creators
-                    SET vertical = ?, audience_profile = ?, industry_keywords = ?, business_functions = ?, pain_points = ?, geo_focus = ?
-                    WHERE podcastindex_id = ?
+                    INSERT OR REPLACE INTO creator_enrichment (
+                        podcastindex_id, uk_score, source_spotify, source_apple, source_youtube,
+                        source_social_twitter, source_social_instagram, source_social_website, source_social_patreon,
+                        cleaned_text_block, raw_text_sources, updated_at
+                    ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, CURRENT_TIMESTAMP)
                     """,
                     (
-                        extracted.get("vertical"),
-                        extracted.get("audience_profile"),
-                        extracted.get("industry_keywords"),
-                        extracted.get("business_functions"),
-                        extracted.get("pain_points"),
-                        extracted.get("geo_focus"),
                         podcastindex_id,
+                        uk_score,
+                        json.dumps(spotify_meta),
+                        json.dumps(apple_meta),
+                        json.dumps(youtube_meta),
+                        json.dumps(social_meta.get("twitter")) if social_meta.get("twitter") else None,
+                        json.dumps(social_meta.get("instagram")) if social_meta.get("instagram") else None,
+                        json.dumps(social_meta.get("website")) if social_meta.get("website") else None,
+                        json.dumps(social_meta.get("patreon")) if social_meta.get("patreon") else None,
+                        cleaned_text,
+                        json.dumps(raw_sources),
                     ),
                 )
-            enriched_rows += 1
-            if enriched_rows % 10 == 0:
-                conn.commit()
-                print(
-                    f"Enriched {enriched_rows}/{len(rows)} (last podcastindex_id={podcastindex_id})"
-                )
+                # Persist structured creator metadata onto creators table
+                extracted = raw_sources.get("extracted_metadata") or {}
+                if extracted:
+                    conn.execute(
+                        """
+                        UPDATE creators
+                        SET vertical = ?, audience_profile = ?, industry_keywords = ?, business_functions = ?, pain_points = ?, geo_focus = ?
+                        WHERE podcastindex_id = ?
+                        """,
+                        (
+                            extracted.get("vertical"),
+                            extracted.get("audience_profile"),
+                            extracted.get("industry_keywords"),
+                            extracted.get("business_functions"),
+                            extracted.get("pain_points"),
+                            extracted.get("geo_focus"),
+                            podcastindex_id,
+                        ),
+                    )
+                if auto_norm:
+                    auto_normalize_creator(podcastindex_id, use_podscan=False)
+                enriched_rows += 1
+                if enriched_rows % 10 == 0:
+                    conn.commit()
+                    print(
+                        f"Enriched {enriched_rows}/{total_label} (last podcastindex_id={podcastindex_id})"
+                    )
+            return False
+
+        if args.only_id:
+            raw_rows = cursor.fetchall()
+            if not raw_rows:
+                print("No creators to enrich.")
+                return 0
+            rows = select_candidates(raw_rows)
+            if not rows:
+                print("No creators to enrich for the requested sources.")
+                return 0
+            had_candidates = True
+            if process_candidates(rows):
+                pass
+        else:
+            current_offset = args.offset
+            while True:
+                batch_params = base_params + [batch_size, current_offset]
+                cursor.execute(query, batch_params)
+                raw_rows = cursor.fetchall()
+                if not raw_rows:
+                    break
+                rows = select_candidates(raw_rows)
+                if rows:
+                    had_candidates = True
+                if process_candidates(rows):
+                    break
+                current_offset += batch_size
+
+        if not had_candidates:
+            print("No creators to enrich for the requested sources.")
+            return 0
 
         conn.commit()
-        print(
-            f"✅ Enriched {enriched_rows} creators. "
-            f"Apple ok: {stats['apple_ok']}, not_found/missing: {stats['apple_not_found']}; "
-            f"Spotify ok: {stats['spotify_ok']}, missing creds: {stats['spotify_missing']}, other: {stats['spotify_not_found']}; "
-            f"YouTube ok: {stats['youtube_ok']}, missing creds: {stats['youtube_missing']}, other: {stats['youtube_not_found']}"
-        )
+        if from_podscan:
+            print(f"✅ Enriched {enriched_rows} creators from Podscan.")
+        else:
+            print(
+                f"✅ Enriched {enriched_rows} creators. "
+                f"Apple ok: {stats['apple_ok']}, not_found/missing: {stats['apple_not_found']}; "
+                f"Spotify ok: {stats['spotify_ok']}, missing creds: {stats['spotify_missing']}, other: {stats['spotify_not_found']}; "
+                f"YouTube ok: {stats['youtube_ok']}, missing creds: {stats['youtube_missing']}, other: {stats['youtube_not_found']}"
+            )
         return 0
     finally:
         conn.close()
@@ -4067,10 +4490,24 @@ def normalize_entities(args: argparse.Namespace) -> int:
             ).fetchall()
             ids = [r[0] for r in rows]
         else:
-            rows = conn.execute(
-                "SELECT podcastindex_id FROM creators WHERE podcastindex_id BETWEEN ? AND ? ORDER BY podcastindex_id",
-                (start_id, end_id),
-            ).fetchall()
+            if getattr(args, "podscan", False):
+                rows = conn.execute(
+                    """
+                    SELECT c.podcastindex_id
+                    FROM creators c
+                    JOIN podscan ps ON ps.podcastindex_id = c.podcastindex_id
+                    WHERE c.podcastindex_id BETWEEN ? AND ?
+                      AND ps.full_json IS NOT NULL
+                      AND TRIM(ps.full_json) <> ''
+                    ORDER BY c.podcastindex_id
+                    """,
+                    (start_id, end_id),
+                ).fetchall()
+            else:
+                rows = conn.execute(
+                    "SELECT podcastindex_id FROM creators WHERE podcastindex_id BETWEEN ? AND ? ORDER BY podcastindex_id",
+                    (start_id, end_id),
+                ).fetchall()
             ids = [r[0] for r in rows]
     else:
         if entity_type == "brand" and getattr(args, "all_brands", False):
@@ -4080,10 +4517,23 @@ def normalize_entities(args: argparse.Namespace) -> int:
             ).fetchall()
             ids = [r[0] for r in rows]
         if entity_type == "creator" and getattr(args, "all_creators", False):
-            rows = conn.execute(
-                "SELECT podcastindex_id FROM creators LIMIT ? OFFSET ?",
-                (args.limit, args.offset),
-            ).fetchall()
+            if getattr(args, "podscan", False):
+                rows = conn.execute(
+                    """
+                    SELECT c.podcastindex_id
+                    FROM creators c
+                    JOIN podscan ps ON ps.podcastindex_id = c.podcastindex_id
+                    WHERE ps.full_json IS NOT NULL
+                      AND TRIM(ps.full_json) <> ''
+                    LIMIT ? OFFSET ?
+                    """,
+                    (args.limit, args.offset),
+                ).fetchall()
+            else:
+                rows = conn.execute(
+                    "SELECT podcastindex_id FROM creators LIMIT ? OFFSET ?",
+                    (args.limit, args.offset),
+                ).fetchall()
             ids = [r[0] for r in rows]
     if not ids:
         print("❌ Provide --id, --podcastindex_ids, or --all-brands/--all-creators", file=sys.stderr)
@@ -4127,7 +4577,10 @@ def normalize_entities(args: argparse.Namespace) -> int:
                     """
                     SELECT c.*
                     FROM creators c
+                    JOIN podscan ps ON ps.podcastindex_id = c.podcastindex_id
                     WHERE c.podcastindex_id=?
+                      AND ps.full_json IS NOT NULL
+                      AND TRIM(ps.full_json) <> ''
                     """,
                     (eid,),
                 ).fetchone()
@@ -5010,6 +5463,16 @@ def parse_args(argv: Optional[Sequence[str]] = None) -> argparse.Namespace:
     enrich_parser.add_argument(
         "--sources",
         help="Comma-separated sources to fetch (default: all). Options: spotify,apple,youtube,social",
+    )
+    enrich_parser.add_argument(
+        "--from-podscan",
+        action="store_true",
+        help="Build enrichment from Podscan JSON for creators missing enrichment (no external API calls)",
+    )
+    enrich_parser.add_argument(
+        "--auto-norm",
+        action="store_true",
+        help="Normalize creators as they are enriched (writes entity_normalized + creators.normalized_*)",
     )
 
     discover_parser = subparsers.add_parser("discover", help="Discover new creators from external sources")
