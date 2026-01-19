@@ -4545,7 +4545,7 @@ def normalize_entities(args: argparse.Namespace) -> int:
         ensure_podscan_table(conn)
 
     entity_type = args.entity_type
-    provider = getattr(args, "llm_provider", resolve_llm_provider(LLM_PROVIDER_META_ENRICH, "local"))
+    provider = getattr(args, "llm_provider", None) or resolve_llm_provider(LLM_PROVIDER_META_ENRICH, "local")
     ollama_model = getattr(args, "ollama_model", LOCAL_OLLAMA_MODEL)
     ids: List[int] = []
     if getattr(args, "id", None):
@@ -4592,6 +4592,7 @@ def normalize_entities(args: argparse.Namespace) -> int:
             ).fetchall()
             ids = [r[0] for r in rows]
         if entity_type == "creator" and getattr(args, "all_creators", False):
+            only_missing = bool(getattr(args, "only_missing", False))
             if getattr(args, "podscan", False):
                 rows = conn.execute(
                     """
@@ -4600,15 +4601,37 @@ def normalize_entities(args: argparse.Namespace) -> int:
                     JOIN podscan ps ON ps.podcastindex_id = c.podcastindex_id
                     WHERE ps.full_json IS NOT NULL
                       AND TRIM(ps.full_json) <> ''
+                      AND (? = 0 OR NOT EXISTS (
+                            SELECT 1 FROM entity_normalized en
+                            WHERE en.entity_type='creator'
+                              AND en.entity_id = c.podcastindex_id
+                              AND en.version='v1'
+                        ))
                     LIMIT ? OFFSET ?
                     """,
-                    (args.limit, args.offset),
+                    (1 if only_missing else 0, args.limit, args.offset),
                 ).fetchall()
             else:
-                rows = conn.execute(
-                    "SELECT podcastindex_id FROM creators LIMIT ? OFFSET ?",
-                    (args.limit, args.offset),
-                ).fetchall()
+                if only_missing:
+                    rows = conn.execute(
+                        """
+                        SELECT c.podcastindex_id
+                        FROM creators c
+                        WHERE NOT EXISTS (
+                            SELECT 1 FROM entity_normalized en
+                            WHERE en.entity_type='creator'
+                              AND en.entity_id = c.podcastindex_id
+                              AND en.version='v1'
+                        )
+                        LIMIT ? OFFSET ?
+                        """,
+                        (args.limit, args.offset),
+                    ).fetchall()
+                else:
+                    rows = conn.execute(
+                        "SELECT podcastindex_id FROM creators LIMIT ? OFFSET ?",
+                        (args.limit, args.offset),
+                    ).fetchall()
             ids = [r[0] for r in rows]
     if not ids:
         print("❌ Provide --id, --podcastindex_ids, or --all-brands/--all-creators", file=sys.stderr)
@@ -5050,22 +5073,38 @@ def embed_entity(args: argparse.Namespace) -> int:
         WHERE en.entity_type='brand' AND en.version='v1'
     """
 
+    model_name = embedding_model
     rows: List[sqlite3.Row]
+    only_missing = bool(getattr(args, "only_missing", False))
     if args.id:
         rows = conn.execute(
             base_query_creator + " AND en.entity_id=?" if entity_type == "creator" else base_query_brand + " AND en.entity_id=?",
             (args.id,),
         ).fetchall()
     else:
-        rows = conn.execute(
-            (base_query_creator if entity_type == "creator" else base_query_brand) + " LIMIT ? OFFSET ?",
-            (args.limit, args.offset),
-        ).fetchall()
+        base_query = base_query_creator if entity_type == "creator" else base_query_brand
+        if only_missing:
+            base_query = base_query + """
+                AND NOT EXISTS (
+                    SELECT 1 FROM entity_embeddings ee
+                    WHERE ee.entity_type = en.entity_type
+                      AND ee.entity_id = en.entity_id
+                      AND ee.model_name = ?
+                )
+            """
+            rows = conn.execute(
+                base_query + " LIMIT ? OFFSET ?",
+                (model_name, args.limit, args.offset),
+            ).fetchall()
+        else:
+            rows = conn.execute(
+                base_query + " LIMIT ? OFFSET ?",
+                (args.limit, args.offset),
+            ).fetchall()
     if not rows:
         print("No normalized records to embed.")
         conn.close()
         return 0
-    model_name = embedding_model
     print(f"Embedding {len(rows)} {entity_type}(s) using provider={embedding_provider}, model={model_name}")
     inserted = 0
     total = len(rows)
@@ -5329,14 +5368,23 @@ def cluster_creators(args: argparse.Namespace) -> int:
         conn.close()
         return 1
     X = np.array(vectors)
+    if args.normalize_vectors:
+        norms = np.linalg.norm(X, axis=1, keepdims=True)
+        norms[norms == 0] = 1.0
+        X = X / norms
 
     params = {"vector_type": vector_type}
     if method == "hdbscan":
-        params["min_cluster_size"] = args.min_cluster_size
-        params["min_samples"] = args.min_samples
+        min_cluster_size = args.min_cluster_size
+        min_samples = args.min_samples
+        if args.auto_params:
+            min_cluster_size = max(5, int(len(X) * 0.02))
+            min_samples = max(2, min(10, int(min_cluster_size * 0.5)))
+        params["min_cluster_size"] = min_cluster_size
+        params["min_samples"] = min_samples
         clusterer = hdbscan.HDBSCAN(
-            min_cluster_size=args.min_cluster_size,
-            min_samples=args.min_samples,
+            min_cluster_size=min_cluster_size,
+            min_samples=min_samples,
         )
         labels = clusterer.fit_predict(X)
         if args.suggest_k:
@@ -5513,13 +5561,38 @@ def cluster_export(args: argparse.Namespace) -> int:
                 writer = csv.writer(f)
                 writer.writerow(header)
                 for r in rows:
-                    writer.writerow([r[h] for h in header])
+                    writer.writerow(
+                        [
+                            r["podcastindex_id"],
+                            r["title"],
+                            r["email"],
+                            r["website"],
+                            r["label"],
+                            r["top_topics"],
+                            r["top_keywords"],
+                            r["size"],
+                            r["method"],
+                            r["vector_type"],
+                        ]
+                    )
             print(f"✅ Wrote {len(rows)} rows to {out_path}")
 
         if print_flag:
             print(",".join(header))
             for r in rows:
-                print(",".join("" if r[h] is None else str(r[h]) for h in header))
+                values = [
+                    r["podcastindex_id"],
+                    r["title"],
+                    r["email"],
+                    r["website"],
+                    r["label"],
+                    r["top_topics"],
+                    r["top_keywords"],
+                    r["size"],
+                    r["method"],
+                    r["vector_type"],
+                ]
+                print(",".join("" if v is None else str(v) for v in values))
         return 0
     finally:
         conn.close()
@@ -6109,8 +6182,8 @@ def parse_args(argv: Optional[Sequence[str]] = None) -> argparse.Namespace:
     norm_entity_parser.add_argument(
         "--llm-provider",
         choices=["local", "openai"],
-        default="local",
-        help="Provider for normalization LLM (default: local via Ollama)",
+        default=None,
+        help="Provider for normalization LLM (default: LLM_PROVIDER_META_ENRICH or local via Ollama)",
     )
     norm_entity_parser.add_argument(
         "--ollama-model",
@@ -6121,6 +6194,11 @@ def parse_args(argv: Optional[Sequence[str]] = None) -> argparse.Namespace:
         "--force",
         action="store_true",
         help="Overwrite existing normalized rows for these entities",
+    )
+    norm_entity_parser.add_argument(
+        "--only-missing",
+        action="store_true",
+        help="Only normalize entities that have no existing normalized row",
     )
     norm_entity_parser.add_argument(
         "--podscan",
@@ -6197,6 +6275,11 @@ def parse_args(argv: Optional[Sequence[str]] = None) -> argparse.Namespace:
         "--force",
         action="store_true",
         help="Re-embed even if embeddings already exist for the entity",
+    )
+    embed_entity_parser.add_argument(
+        "--only-missing",
+        action="store_true",
+        help="Only embed entities that have no embeddings for the selected model",
     )
     embed_entity_parser.add_argument(
         "--embedding-mode",
@@ -6336,6 +6419,16 @@ def parse_args(argv: Optional[Sequence[str]] = None) -> argparse.Namespace:
         type=int,
         default=5,
         help="HDBSCAN min samples (default: 5)",
+    )
+    cluster_parser.add_argument(
+        "--normalize-vectors",
+        action="store_true",
+        help="L2-normalize vectors before clustering",
+    )
+    cluster_parser.add_argument(
+        "--auto-params",
+        action="store_true",
+        help="Auto-tune HDBSCAN params based on dataset size",
     )
     cluster_parser.add_argument(
         "--suggest-k",
