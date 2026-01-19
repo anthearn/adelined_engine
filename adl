@@ -659,6 +659,42 @@ def ensure_creator_cluster_labels_table(conn: sqlite3.Connection) -> None:
     )
 
 
+def ensure_survey_templates_table(conn: sqlite3.Connection) -> None:
+    conn.execute(
+        """
+        CREATE TABLE IF NOT EXISTS survey_templates (
+            id INTEGER PRIMARY KEY AUTOINCREMENT,
+            name TEXT UNIQUE,
+            created_at DATETIME DEFAULT CURRENT_TIMESTAMP
+        )
+        """
+    )
+
+
+def ensure_creator_surveys_table(conn: sqlite3.Connection) -> None:
+    conn.execute(
+        """
+        CREATE TABLE IF NOT EXISTS creator_surveys (
+            id INTEGER PRIMARY KEY AUTOINCREMENT,
+            creator_adlid INTEGER NOT NULL,
+            podcast TEXT,
+            name TEXT,
+            comment TEXT,
+            url TEXT,
+            email TEXT NOT NULL,
+            itunes TEXT,
+            template TEXT,
+            sent_date TEXT,
+            received_date TEXT,
+            response TEXT,
+            survey_template_id INTEGER,
+            has_duplicate INTEGER DEFAULT 0,
+            created_at DATETIME DEFAULT CURRENT_TIMESTAMP
+        )
+        """
+    )
+
+
 def ensure_podscan_table(conn: sqlite3.Connection) -> None:
     conn.execute(
         """
@@ -5598,6 +5634,166 @@ def cluster_export(args: argparse.Namespace) -> int:
         conn.close()
 
 
+def import_email_survey(args: argparse.Namespace) -> int:
+    db_path = Path(args.adl_db)
+    if not db_path.exists():
+        print(f"❌ DB not found: {db_path}", file=sys.stderr)
+        return 1
+    in_path = Path(args.file)
+    if not in_path.exists():
+        print(f"❌ File not found: {in_path}", file=sys.stderr)
+        return 1
+    raw = in_path.read_text()
+    if not raw.strip():
+        print("❌ Empty file.", file=sys.stderr)
+        return 1
+
+    try:
+        dialect = csv.Sniffer().sniff(raw[:4096])
+    except Exception:
+        dialect = csv.excel
+    reader = csv.DictReader(raw.splitlines(), dialect=dialect)
+    if not reader.fieldnames:
+        print("❌ Missing CSV headers.", file=sys.stderr)
+        return 1
+
+    def norm_key(key: str) -> str:
+        return re.sub(r"\\s+", " ", key.strip().lower())
+
+    def get_field(row: Dict[str, str], name: str) -> str:
+        for k, v in row.items():
+            if norm_key(k) == name:
+                return (v or "").strip()
+        return ""
+
+    conn = sqlite3.connect(db_path, timeout=10)
+    conn.row_factory = sqlite3.Row
+    configure_sqlite(conn)
+    ensure_creators_table(conn)
+    ensure_podscan_table(conn)
+    ensure_survey_templates_table(conn)
+    ensure_creator_surveys_table(conn)
+
+    inserted = 0
+    updated = 0
+    skipped = 0
+    duplicates = 0
+
+    for row in reader:
+        email = get_field(row, "email")
+        if not email:
+            skipped += 1
+            continue
+
+        template = get_field(row, "template")
+        sent_date = get_field(row, "sent date")
+        received_date = get_field(row, "received date")
+        response = get_field(row, "response")
+        comment = get_field(row, "comment")
+        if not sent_date:
+            skipped += 1
+            continue
+        survey_template_id = None
+        if template:
+            conn.execute(
+                "INSERT OR IGNORE INTO survey_templates (name) VALUES (?)",
+                (template,),
+            )
+            tpl_row = conn.execute(
+                "SELECT id FROM survey_templates WHERE name = ?",
+                (template,),
+            ).fetchone()
+            survey_template_id = tpl_row["id"] if tpl_row else None
+
+        existing = conn.execute(
+            """
+            SELECT id, response, received_date
+            FROM creator_surveys
+            WHERE LOWER(email) = LOWER(?)
+              AND COALESCE(sent_date, '') = COALESCE(?, '')
+              AND COALESCE(template, '') = COALESCE(?, '')
+            ORDER BY id
+            LIMIT 1
+            """,
+            (email, sent_date, template or ""),
+        ).fetchone()
+        if existing:
+            existing_response = (existing["response"] or "").strip()
+            existing_received = (existing["received_date"] or "").strip()
+            if not existing_response and not existing_received:
+                conn.execute(
+                    """
+                    UPDATE creator_surveys
+                    SET comment = ?, response = ?, received_date = ?, survey_template_id = ?
+                    WHERE id = ?
+                    """,
+                    (
+                        comment or None,
+                        response or None,
+                        received_date or None,
+                        survey_template_id,
+                        existing["id"],
+                    ),
+                )
+                updated += 1
+            else:
+                skipped += 1
+            continue
+
+        matches = conn.execute(
+            """
+            SELECT c.adlid
+            FROM creators c
+            JOIN podscan p ON p.podcastindex_id = c.podcastindex_id
+            WHERE LOWER(p.email) = LOWER(?)
+            ORDER BY c.adlid
+            """,
+            (email,),
+        ).fetchall()
+        if not matches:
+            skipped += 1
+            continue
+        creator_adlid = matches[0]["adlid"]
+        has_duplicate = 1 if len(matches) > 1 else 0
+        if has_duplicate:
+            duplicates += 1
+
+        conn.execute(
+            """
+            INSERT INTO creator_surveys (
+                creator_adlid, podcast, name, comment, url, email, itunes, template,
+                sent_date, received_date, response, survey_template_id, has_duplicate
+            ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+            """,
+            (
+                creator_adlid,
+                get_field(row, "podcast"),
+                get_field(row, "name"),
+                comment or None,
+                get_field(row, "url"),
+                email,
+                get_field(row, "itunes"),
+                template or None,
+                sent_date or None,
+                received_date or None,
+                response or None,
+                survey_template_id,
+                has_duplicate,
+            ),
+        )
+        inserted += 1
+
+    conn.commit()
+    conn.close()
+    print(
+        f"✅ Imported {inserted} survey rows. "
+        f"Updated: {updated}. "
+        f"Skipped: {skipped} (missing email, creator match, or existing response). "
+        f"Duplicates flagged: {duplicates}."
+    )
+    return 0
+
+
 def rank_entities(args: argparse.Namespace) -> int:
     db_path = Path(args.adl_db)
     if not db_path.exists():
@@ -6491,6 +6687,25 @@ def parse_args(argv: Optional[Sequence[str]] = None) -> argparse.Namespace:
         help="Path to Adelined SQLite database (default: adelined_matching.db)",
     )
 
+    import_parser = subparsers.add_parser("import", help="Import data into Adelined tables")
+    import_parser.add_argument(
+        "--type",
+        required=True,
+        choices=["email-survey"],
+        help="Import type",
+    )
+    import_parser.add_argument(
+        "--file",
+        required=True,
+        help="Input CSV file path",
+    )
+    import_parser.add_argument(
+        "--adl-db",
+        type=Path,
+        default=Path("adelined_matching.db"),
+        help="Path to Adelined SQLite database (default: adelined_matching.db)",
+    )
+
     test_enrich = subparsers.add_parser("test-enrich", help="Dump enrichment for a creator")
     test_enrich.add_argument(
         "--pid",
@@ -6683,6 +6898,9 @@ def main(argv: Optional[Sequence[str]] = None) -> int:
         return cluster_creators(args)
     if args.action == "cluster-export":
         return cluster_export(args)
+    if args.action == "import":
+        if args.type == "email-survey":
+            return import_email_survey(args)
     if args.action == "compare-creators":
         return compare_creators(args)
     if args.action == "test-enrich":
