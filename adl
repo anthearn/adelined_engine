@@ -15,6 +15,10 @@ import sqlite3
 import sys
 import threading
 import time
+import email
+import subprocess
+from email import policy
+from email.utils import getaddresses, parsedate_to_datetime
 from dataclasses import dataclass
 from datetime import datetime, timedelta
 from pathlib import Path
@@ -37,6 +41,8 @@ OLLAMA_HOST = os.getenv("OLLAMA_HOST", "http://localhost:11434")
 LLM_PROVIDER_META_ENRICH = "LLM_PROVIDER_META_ENRICH"
 LLM_PROVIDER_EMBED = "LLM_PROVIDER_EMBED"
 PODSCAN_API_BASE = "https://podscan.fm/api/v1"
+SURVEY_RESPONSE_PROMPT_VERSION = "v1"
+SURVEY_RESPONSE_MODEL = "gpt-4o-mini"
 
 
 def resolve_llm_provider(env_var: str, default: str) -> str:
@@ -691,6 +697,47 @@ def ensure_creator_surveys_table(conn: sqlite3.Connection) -> None:
             has_duplicate INTEGER DEFAULT 0,
             created_at DATETIME DEFAULT CURRENT_TIMESTAMP
         )
+        """
+    )
+    ensure_column(conn, "creator_surveys", "response_received_at", "TEXT")
+    ensure_column(conn, "creator_surveys", "raw_response_text", "TEXT")
+
+
+def ensure_survey_responses_table(conn: sqlite3.Connection) -> None:
+    conn.execute(
+        """
+        CREATE TABLE IF NOT EXISTS survey_responses (
+            id INTEGER PRIMARY KEY AUTOINCREMENT,
+            creator_survey_id INTEGER NOT NULL,
+            adlid INTEGER,
+            source TEXT,
+            sender_email TEXT,
+            received_at TEXT,
+            subject TEXT,
+            message_id TEXT,
+            in_reply_to TEXT,
+            raw_eml_path TEXT,
+            raw_body TEXT,
+            parsed_fields_json TEXT,
+            qa_json TEXT,
+            model_name TEXT,
+            prompt_version TEXT,
+            created_at DATETIME DEFAULT CURRENT_TIMESTAMP,
+            updated_at DATETIME DEFAULT CURRENT_TIMESTAMP
+        )
+        """
+    )
+    conn.execute(
+        """
+        CREATE INDEX IF NOT EXISTS idx_survey_responses_creator_received
+        ON survey_responses(creator_survey_id, received_at)
+        """
+    )
+    conn.execute(
+        """
+        CREATE UNIQUE INDEX IF NOT EXISTS idx_survey_responses_message_id
+        ON survey_responses(message_id)
+        WHERE message_id IS NOT NULL
         """
     )
 
@@ -5639,23 +5686,126 @@ def import_email_survey(args: argparse.Namespace) -> int:
     if not db_path.exists():
         print(f"❌ DB not found: {db_path}", file=sys.stderr)
         return 1
-    in_path = Path(args.file)
-    if not in_path.exists():
-        print(f"❌ File not found: {in_path}", file=sys.stderr)
-        return 1
-    raw = in_path.read_text()
-    if not raw.strip():
-        print("❌ Empty file.", file=sys.stderr)
-        return 1
 
-    try:
-        dialect = csv.Sniffer().sniff(raw[:4096])
-    except Exception:
-        dialect = csv.excel
-    reader = csv.DictReader(raw.splitlines(), dialect=dialect)
-    if not reader.fieldnames:
-        print("❌ Missing CSV headers.", file=sys.stderr)
-        return 1
+    expected_headers = [
+        "Podcast",
+        "Name",
+        "Comment",
+        "URL",
+        "Email",
+        "iTunes",
+        "Template",
+        "Sent Date",
+        "Received Date",
+        "Response",
+    ]
+
+    def load_rows_from_csv_text(raw: str) -> List[Dict[str, str]]:
+        if not raw.strip():
+            raise ValueError("Empty file")
+        try:
+            dialect = csv.Sniffer().sniff(raw[:4096])
+        except Exception:
+            dialect = csv.excel
+        reader = csv.DictReader(raw.splitlines(), dialect=dialect)
+        if not reader.fieldnames:
+            raise ValueError("Missing CSV headers")
+        headers = [h.strip() for h in reader.fieldnames if h is not None]
+        if headers != expected_headers:
+            raise ValueError(f"Header mismatch. Expected: {expected_headers}")
+        return list(reader)
+
+    def load_rows_from_sheet() -> List[Dict[str, str]]:
+        sheet_url = getattr(args, "sheet_url", None)
+        if not sheet_url:
+            raise ValueError("Missing --sheet-url")
+
+        def extract_sheet_id(url: str) -> str:
+            match = re.search(r"/spreadsheets/d/([a-zA-Z0-9-_]+)", url)
+            if not match:
+                raise ValueError("Could not extract sheet id from URL")
+            return match.group(1)
+
+        def extract_gid(url: str) -> Optional[int]:
+            match = re.search(r"[?&]gid=(\\d+)", url)
+            return int(match.group(1)) if match else None
+
+        sheet_id = extract_sheet_id(sheet_url)
+        gid = extract_gid(sheet_url)
+        if getattr(args, "gid", None):
+            gid = int(args.gid)
+        tab_name = getattr(args, "tab_name", None)
+        tab_index = getattr(args, "tab_index", None)
+
+        def load_rows_from_public_csv() -> List[Dict[str, str]]:
+            if tab_name or tab_index is not None:
+                raise ValueError("Public CSV export requires --gid (tab name/index needs auth).")
+            public_gid = gid if gid is not None else 0
+            csv_url = f"https://docs.google.com/spreadsheets/d/{sheet_id}/export?format=csv&gid={public_gid}"
+            res = requests.get(csv_url, timeout=30)
+            res.raise_for_status()
+            rows = list(csv.reader(res.text.splitlines()))
+            if not rows:
+                raise ValueError("Sheet is empty")
+            headers = rows[0]
+            if headers != expected_headers:
+                raise ValueError(f"Header mismatch. Expected: {expected_headers}. Found: {headers}")
+            out = []
+            for row in rows[1:]:
+                padded = row + [""] * (len(headers) - len(row))
+                out.append({headers[i]: padded[i] for i in range(len(headers))})
+            return out
+
+        try:
+            import gspread  # type: ignore
+            import google.auth  # type: ignore
+            try:
+                creds, _ = google.auth.default(scopes=["https://www.googleapis.com/auth/spreadsheets.readonly"])
+                gc = gspread.authorize(creds)
+                sh = gc.open_by_key(sheet_id)
+                if tab_name:
+                    ws = sh.worksheet(tab_name)
+                elif tab_index is not None:
+                    ws = sh.get_worksheet(int(tab_index))
+                elif gid is not None:
+                    ws = sh.get_worksheet_by_id(gid)
+                else:
+                    ws = sh.sheet1
+                rows = ws.get_all_values()
+                if not rows:
+                    raise ValueError("Sheet is empty")
+                headers = rows[0]
+                if headers != expected_headers:
+                    raise ValueError(f"Header mismatch. Expected: {expected_headers}. Found: {headers}")
+                out = []
+                for row in rows[1:]:
+                    padded = row + [""] * (len(headers) - len(row))
+                    out.append({headers[i]: padded[i] for i in range(len(headers))})
+                return out
+            except Exception as exc:
+                print(f"⚠️ Google auth unavailable ({exc}); attempting public CSV export...", file=sys.stderr)
+                return load_rows_from_public_csv()
+        except Exception:
+            print("⚠️ gspread/google-auth not available; attempting public CSV export...", file=sys.stderr)
+            return load_rows_from_public_csv()
+
+    if getattr(args, "sheet_url", None):
+        try:
+            rows = load_rows_from_sheet()
+        except Exception as exc:
+            print(f"❌ Sheet import failed: {exc}", file=sys.stderr)
+            return 1
+    else:
+        in_path = Path(args.file)
+        if not in_path.exists():
+            print(f"❌ File not found: {in_path}", file=sys.stderr)
+            return 1
+        raw = in_path.read_text()
+        try:
+            rows = load_rows_from_csv_text(raw)
+        except Exception as exc:
+            print(f"❌ CSV import failed: {exc}", file=sys.stderr)
+            return 1
 
     def norm_key(key: str) -> str:
         return re.sub(r"\\s+", " ", key.strip().lower())
@@ -5679,7 +5829,7 @@ def import_email_survey(args: argparse.Namespace) -> int:
     skipped = 0
     duplicates = 0
 
-    for row in reader:
+    for row in rows:
         email = get_field(row, "email")
         if not email:
             skipped += 1
@@ -5790,6 +5940,274 @@ def import_email_survey(args: argparse.Namespace) -> int:
         f"Updated: {updated}. "
         f"Skipped: {skipped} (missing email, creator match, or existing response). "
         f"Duplicates flagged: {duplicates}."
+    )
+    return 0
+
+
+def import_survey_response_eml(args: argparse.Namespace) -> int:
+    db_path = Path(args.adl_db)
+    if not db_path.exists():
+        print(f"❌ DB not found: {db_path}", file=sys.stderr)
+        return 1
+    eml_dir = Path(args.dir)
+    if not eml_dir.exists() or not eml_dir.is_dir():
+        print(f"❌ Directory not found: {eml_dir}", file=sys.stderr)
+        return 1
+
+    eml_paths = sorted(eml_dir.glob("*.eml"))
+    if not eml_paths:
+        print("No .eml files found.", file=sys.stderr)
+        return 1
+
+    def extract_sender_email(raw_from: Optional[str]) -> Optional[str]:
+        addrs = getaddresses([raw_from or ""])
+        for _, addr in addrs:
+            if addr and "@" in addr:
+                return addr.strip().lower()
+        match = re.search(r"([A-Za-z0-9._%+\\-]+@[A-Za-z0-9.\\-]+\\.[A-Za-z]{2,})", raw_from or "")
+        return match.group(1).lower() if match else None
+
+    def parse_received_at(msg: email.message.Message, path: Path) -> str:
+        raw_date = msg.get("Date")
+        if raw_date:
+            try:
+                dt = parsedate_to_datetime(raw_date)
+                if dt:
+                    return dt.isoformat()
+            except Exception:
+                pass
+        return datetime.fromtimestamp(path.stat().st_mtime).isoformat()
+
+    def extract_body(msg: email.message.Message) -> str:
+        text_body = None
+        html_body = None
+        if msg.is_multipart():
+            for part in msg.walk():
+                if part.get_content_disposition() == "attachment":
+                    continue
+                ctype = part.get_content_type()
+                if ctype == "text/plain" and text_body is None:
+                    text_body = part.get_payload(decode=True)
+                elif ctype == "text/html" and html_body is None:
+                    html_body = part.get_payload(decode=True)
+        else:
+            ctype = msg.get_content_type()
+            payload = msg.get_payload(decode=True)
+            if ctype == "text/plain":
+                text_body = payload
+            elif ctype == "text/html":
+                html_body = payload
+
+        if text_body:
+            return text_body.decode(errors="replace")
+        if html_body:
+            html_text = html_body.decode(errors="replace")
+            return BeautifulSoup(html_text, "html.parser").get_text(" ")
+        return ""
+
+    def strip_quoted(text: str) -> str:
+        if not text:
+            return text
+        patterns = [
+            r"\\nOn .+ wrote:\\n",
+            r"\\nFrom: .+\\n",
+            r"\\n-----Original Message-----\\n",
+            r"\\n---+ Forwarded message ---+\\n",
+        ]
+        cleaned = text
+        for pat in patterns:
+            m = re.search(pat, cleaned, flags=re.IGNORECASE)
+            if m:
+                cleaned = cleaned[: m.start()].strip()
+        lines = []
+        for line in cleaned.splitlines():
+            if line.strip().startswith(">"):
+                continue
+            lines.append(line)
+        cleaned = "\n".join(lines)
+        cleaned = re.sub(r"\\n{3,}", "\\n\\n", cleaned)
+        cleaned = re.sub(r"[ \\t]+", " ", cleaned).strip()
+        return cleaned
+
+    conn = sqlite3.connect(db_path, timeout=10)
+    conn.row_factory = sqlite3.Row
+    configure_sqlite(conn)
+    ensure_creator_surveys_table(conn)
+    ensure_survey_responses_table(conn)
+
+    files_scanned = 0
+    matched = 0
+    unmatched = 0
+    inserted = 0
+    updated = 0
+    openai_calls = 0
+    failures = 0
+    confirmed_openai = False
+
+    for path in eml_paths:
+        files_scanned += 1
+        try:
+            msg = email.message_from_bytes(path.read_bytes(), policy=policy.default)
+        except Exception as exc:
+            print(f"\033[33m⚠️ Failed to parse {path}: {exc}\033[0m", file=sys.stderr)
+            failures += 1
+            continue
+
+        sender_email = extract_sender_email(msg.get("From"))
+        if not sender_email:
+            print(f"\033[33m⚠️ No sender email found for {path}\033[0m", file=sys.stderr)
+            unmatched += 1
+            continue
+
+        received_at = parse_received_at(msg, path)
+        subject = (msg.get("Subject") or "").strip() or None
+        message_id = (msg.get("Message-ID") or "").strip() or None
+        in_reply_to = (msg.get("In-Reply-To") or "").strip() or None
+        raw_body = strip_quoted(extract_body(msg))
+        if len(raw_body) > 12000:
+            raw_body = raw_body[:12000]
+
+        survey_row = conn.execute(
+            """
+            SELECT id, creator_adlid, response_received_at, raw_response_text
+            FROM creator_surveys
+            WHERE LOWER(email) = LOWER(?)
+            ORDER BY id
+            LIMIT 1
+            """,
+            (sender_email,),
+        ).fetchone()
+        if not survey_row:
+            print(f"\033[33m⚠️ No creator_survey match for {sender_email} ({path.name})\033[0m", file=sys.stderr)
+            unmatched += 1
+            continue
+        matched += 1
+
+        existing_received = (survey_row["response_received_at"] or "").strip()
+        update_received = False
+        if not existing_received:
+            update_received = True
+        else:
+            try:
+                prev_dt = datetime.fromisoformat(existing_received)
+                curr_dt = datetime.fromisoformat(received_at)
+                if curr_dt > prev_dt:
+                    update_received = True
+            except Exception:
+                update_received = True
+
+        existing_raw = (survey_row["raw_response_text"] or "").strip()
+        appended_raw = existing_raw
+        stamp = received_at
+        entry = f"[{stamp}]\\n{raw_body}".strip()
+        if entry:
+            appended_raw = f"{existing_raw}\\n\\n{entry}".strip() if existing_raw else entry
+
+        if update_received or entry:
+            conn.execute(
+                """
+                UPDATE creator_surveys
+                SET response_received_at = ?, raw_response_text = ?
+                WHERE id = ?
+                """,
+                (received_at if update_received else existing_received, appended_raw, survey_row["id"]),
+            )
+            updated += 1
+
+        if not confirmed_openai:
+            confirmed_openai = ensure_openai_confirmation("survey response parsing", allow_fallback=False)
+            if not confirmed_openai:
+                print("\033[33m⚠️ OpenAI confirmation declined. Stopping import.\033[0m", file=sys.stderr)
+                conn.commit()
+                conn.close()
+                print(
+                    f"Files scanned: {files_scanned}; matched: {matched}; unmatched: {unmatched}; "
+                    f"inserted: {inserted}; updated: {updated}; openai_calls: {openai_calls}; failures: {failures}"
+                )
+                return 0
+
+        parsed_fields = None
+        qa_fields = None
+        try:
+            key = os.getenv("OPENAI_API_KEY")
+            if not key:
+                raise RuntimeError("OPENAI_API_KEY not set")
+            client = OpenAI(api_key=key)
+            prompt_1 = (
+                "Extract structured signals from the email reply.\n"
+                "Return strict JSON with keys:\n"
+                "intent (answered|interested|not_interested|questions|unsubscribe|out_of_office|unclear),\n"
+                "confidence (0..1), summary, signals (mentions_pricing, mentions_sponsors, mentions_agency_or_network, language, country_hint, followup_recommended),\n"
+                "entities (podcast_name_guess, host_name_guess, urls, emails).\n\n"
+                f"Email body:\\n{raw_body}"
+            )
+            resp = client.chat.completions.create(
+                model=SURVEY_RESPONSE_MODEL,
+                messages=[{"role": "user", "content": prompt_1}],
+                temperature=0.2,
+                response_format={"type": "json_object"},
+            )
+            parsed_fields = json.loads(resp.choices[0].message.content)
+            openai_calls += 1
+
+            prompt_2 = (
+                "Map the email reply to survey answers. Return strict JSON with:\n"
+                "answers object containing: monetisation_status, biggest_challenges (array), relevance_value, formats_of_interest (array), open_comment, price_band,\n"
+                "confidence_by_field object.\n"
+                "Infer best-fit answers; if missing, return null and low confidence.\n\n"
+                f"Email body:\\n{raw_body}"
+            )
+            resp2 = client.chat.completions.create(
+                model=SURVEY_RESPONSE_MODEL,
+                messages=[{"role": "user", "content": prompt_2}],
+                temperature=0.2,
+                response_format={"type": "json_object"},
+            )
+            qa_fields = json.loads(resp2.choices[0].message.content)
+            openai_calls += 1
+        except Exception as exc:
+            print(f"\033[33m⚠️ OpenAI parse failed for {path}: {exc}\033[0m", file=sys.stderr)
+            failures += 1
+
+        try:
+            conn.execute(
+                """
+                INSERT INTO survey_responses (
+                    creator_survey_id, adlid, source, sender_email, received_at, subject,
+                    message_id, in_reply_to, raw_eml_path, raw_body, parsed_fields_json, qa_json,
+                    model_name, prompt_version, updated_at
+                ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, CURRENT_TIMESTAMP)
+                """,
+                (
+                    survey_row["id"],
+                    survey_row["creator_adlid"],
+                    "eml",
+                    sender_email,
+                    received_at,
+                    subject,
+                    message_id,
+                    in_reply_to,
+                    str(path),
+                    raw_body,
+                    json.dumps(parsed_fields) if parsed_fields else None,
+                    json.dumps(qa_fields) if qa_fields else None,
+                    SURVEY_RESPONSE_MODEL,
+                    SURVEY_RESPONSE_PROMPT_VERSION,
+                ),
+            )
+            inserted += 1
+        except sqlite3.IntegrityError as exc:
+            print(f"\033[33m⚠️ Duplicate or invalid insert for {path}: {exc}\033[0m", file=sys.stderr)
+            failures += 1
+            continue
+
+    conn.commit()
+    conn.close()
+    print(
+        "Import complete. "
+        f"files_scanned={files_scanned}, matched_creator_surveys={matched}, unmatched_sender={unmatched}, "
+        f"inserted_survey_responses={inserted}, updated_creator_surveys={updated}, "
+        f"openai_calls_made={openai_calls}, failures={failures}"
     )
     return 0
 
@@ -6691,13 +7109,34 @@ def parse_args(argv: Optional[Sequence[str]] = None) -> argparse.Namespace:
     import_parser.add_argument(
         "--type",
         required=True,
-        choices=["email-survey"],
+        choices=["email-survey", "survey-response-eml"],
         help="Import type",
     )
     import_parser.add_argument(
         "--file",
-        required=True,
-        help="Input CSV file path",
+        help="Input CSV file path (required for email-survey)",
+    )
+    import_parser.add_argument(
+        "--dir",
+        help="Directory of .eml files (required for survey-response-eml)",
+    )
+    import_parser.add_argument(
+        "--sheet-url",
+        help="Google Sheet URL (optional for email-survey)",
+    )
+    import_parser.add_argument(
+        "--gid",
+        type=int,
+        help="Override sheet gid (useful for public CSV export)",
+    )
+    import_parser.add_argument(
+        "--tab-name",
+        help="Worksheet tab name (requires Google auth)",
+    )
+    import_parser.add_argument(
+        "--tab-index",
+        type=int,
+        help="Worksheet tab index (requires Google auth)",
     )
     import_parser.add_argument(
         "--adl-db",
@@ -6900,7 +7339,15 @@ def main(argv: Optional[Sequence[str]] = None) -> int:
         return cluster_export(args)
     if args.action == "import":
         if args.type == "email-survey":
+            if not getattr(args, "file", None) and not getattr(args, "sheet_url", None):
+                print("❌ Provide --file or --sheet-url for import --type email-survey", file=sys.stderr)
+                return 1
             return import_email_survey(args)
+        if args.type == "survey-response-eml":
+            if not getattr(args, "dir", None):
+                print("❌ --dir is required for import --type survey-response-eml", file=sys.stderr)
+                return 1
+            return import_survey_response_eml(args)
     if args.action == "compare-creators":
         return compare_creators(args)
     if args.action == "test-enrich":
