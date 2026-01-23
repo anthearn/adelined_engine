@@ -16,6 +16,7 @@ import sys
 import threading
 import time
 import email
+import quopri
 import subprocess
 from email import policy
 from email.utils import getaddresses, parsedate_to_datetime
@@ -703,6 +704,33 @@ def ensure_creator_surveys_table(conn: sqlite3.Connection) -> None:
     ensure_column(conn, "creator_surveys", "raw_response_text", "TEXT")
 
 
+def ensure_creator_survey_status_table(conn: sqlite3.Connection) -> None:
+    conn.execute(
+        """
+        CREATE TABLE IF NOT EXISTS creator_survey_status (
+            id INTEGER PRIMARY KEY AUTOINCREMENT,
+            creator_survey_id INTEGER NOT NULL,
+            status_code INTEGER NOT NULL,
+            created_at DATETIME DEFAULT CURRENT_TIMESTAMP,
+            updated_at DATETIME DEFAULT CURRENT_TIMESTAMP,
+            FOREIGN KEY (creator_survey_id) REFERENCES creator_surveys(id)
+        )
+        """
+    )
+    conn.execute(
+        """
+        CREATE UNIQUE INDEX IF NOT EXISTS idx_creator_survey_status_survey
+        ON creator_survey_status(creator_survey_id)
+        """
+    )
+    conn.execute(
+        """
+        CREATE INDEX IF NOT EXISTS idx_creator_survey_status_code
+        ON creator_survey_status(status_code)
+        """
+    )
+
+
 def ensure_survey_responses_table(conn: sqlite3.Connection) -> None:
     conn.execute(
         """
@@ -739,6 +767,21 @@ def ensure_survey_responses_table(conn: sqlite3.Connection) -> None:
         ON survey_responses(message_id)
         WHERE message_id IS NOT NULL
         """
+    )
+
+
+def upsert_creator_survey_status(
+    conn: sqlite3.Connection, creator_survey_id: int, status_code: int
+) -> None:
+    conn.execute(
+        """
+        INSERT INTO creator_survey_status (creator_survey_id, status_code, updated_at)
+        VALUES (?, ?, CURRENT_TIMESTAMP)
+        ON CONFLICT(creator_survey_id) DO UPDATE SET
+            status_code = excluded.status_code,
+            updated_at = CURRENT_TIMESTAMP
+        """,
+        (creator_survey_id, status_code),
     )
 
 
@@ -5823,6 +5866,7 @@ def import_email_survey(args: argparse.Namespace) -> int:
     ensure_podscan_table(conn)
     ensure_survey_templates_table(conn)
     ensure_creator_surveys_table(conn)
+    ensure_creator_survey_status_table(conn)
 
     inserted = 0
     updated = 0
@@ -5885,20 +5929,29 @@ def import_email_survey(args: argparse.Namespace) -> int:
                         existing["id"],
                     ),
                 )
+                status_code = 200 if (response or received_date) else 100
+                upsert_creator_survey_status(conn, existing["id"], status_code)
                 updated += 1
             else:
                 skipped += 1
             continue
 
+        email_norm = email.strip().lower()
         matches = conn.execute(
             """
             SELECT c.adlid
             FROM creators c
             JOIN podscan p ON p.podcastindex_id = c.podcastindex_id
-            WHERE LOWER(p.email) = LOWER(?)
+            WHERE (
+                LOWER(p.email) = ?
+                OR instr(
+                    ',' || LOWER(REPLACE(REPLACE(REPLACE(REPLACE(REPLACE(p.email, ';', ','), ' ', ''), '\\n', ''), '\\r', ''), '\\t', '')) || ',',
+                    ',' || ? || ','
+                ) > 0
+            )
             ORDER BY c.adlid
             """,
-            (email,),
+            (email_norm, email_norm),
         ).fetchall()
         if not matches:
             skipped += 1
@@ -5908,7 +5961,7 @@ def import_email_survey(args: argparse.Namespace) -> int:
         if has_duplicate:
             duplicates += 1
 
-        conn.execute(
+        cursor = conn.execute(
             """
             INSERT INTO creator_surveys (
                 creator_adlid, podcast, name, comment, url, email, itunes, template,
@@ -5931,6 +5984,8 @@ def import_email_survey(args: argparse.Namespace) -> int:
                 has_duplicate,
             ),
         )
+        status_code = 200 if (response or received_date) else 100
+        upsert_creator_survey_status(conn, cursor.lastrowid, status_code)
         inserted += 1
 
     conn.commit()
@@ -5949,12 +6004,33 @@ def import_survey_response_eml(args: argparse.Namespace) -> int:
     if not db_path.exists():
         print(f"❌ DB not found: {db_path}", file=sys.stderr)
         return 1
-    eml_dir = Path(args.dir)
+    eml_dir = Path(args.dir) if getattr(args, "dir", None) else None
+    gdrive_url = getattr(args, "gdrive_folder_url", None)
+    if gdrive_url:
+        try:
+            import gdown  # type: ignore
+        except Exception:
+            print("❌ gdown is required for --gdrive-folder-url. pip install gdown", file=sys.stderr)
+            return 1
+        download_dir = Path("tests") / "gdrive_eml_import"
+        download_dir.mkdir(parents=True, exist_ok=True)
+        gdown.download_folder(url=gdrive_url, output=str(download_dir), quiet=True, use_cookies=False)
+        eml_dir = download_dir
+    if not eml_dir:
+        print("❌ --dir or --gdrive-folder-url is required for survey-response-eml", file=sys.stderr)
+        return 1
     if not eml_dir.exists() or not eml_dir.is_dir():
         print(f"❌ Directory not found: {eml_dir}", file=sys.stderr)
         return 1
 
     eml_paths = sorted(eml_dir.glob("*.eml"))
+    name_filter = getattr(args, "filter", None)
+    if name_filter:
+        needle = name_filter.lower()
+        eml_paths = [p for p in eml_paths if needle in p.name.lower()]
+    if getattr(args, "limit", None):
+        eml_paths = eml_paths[: max(0, int(args.limit))]
+    debug_eml = bool(getattr(args, "debug", False))
     if not eml_paths:
         print("No .eml files found.", file=sys.stderr)
         return 1
@@ -5967,6 +6043,12 @@ def import_survey_response_eml(args: argparse.Namespace) -> int:
         match = re.search(r"([A-Za-z0-9._%+\\-]+@[A-Za-z0-9.\\-]+\\.[A-Za-z]{2,})", raw_from or "")
         return match.group(1).lower() if match else None
 
+    def extract_emails_from_text(text: str) -> List[str]:
+        if not text:
+            return []
+        matches = re.findall(r"([A-Za-z0-9._%+\\-]+@[A-Za-z0-9.\\-]+\\.[A-Za-z]{2,})", text)
+        return [m.lower() for m in matches]
+
     def parse_received_at(msg: email.message.Message, path: Path) -> str:
         raw_date = msg.get("Date")
         if raw_date:
@@ -5978,6 +6060,92 @@ def import_survey_response_eml(args: argparse.Namespace) -> int:
                 pass
         return datetime.fromtimestamp(path.stat().st_mtime).isoformat()
 
+    def extract_dsn_recipient(msg: email.message.Message) -> Optional[str]:
+        for part in msg.walk():
+            if part.get_content_type() != "message/delivery-status":
+                continue
+            payload = part.get_payload()
+            if isinstance(payload, list):
+                chunks = []
+                for item in payload:
+                    if hasattr(item, "as_string"):
+                        chunks.append(item.as_string())
+                    elif isinstance(item, bytes):
+                        chunks.append(item.decode(errors="replace"))
+                    elif isinstance(item, str):
+                        chunks.append(item)
+                text = "\n".join(chunks)
+            elif isinstance(payload, bytes):
+                text = payload.decode(errors="replace")
+            elif isinstance(payload, str):
+                text = payload
+            else:
+                text = str(payload or "")
+            if not text:
+                continue
+            match = re.search(
+                r"(Final-Recipient|Original-Recipient):\\s*[^;]+;\\s*([A-Za-z0-9._%+\\-]+@[A-Za-z0-9.\\-]+\\.[A-Za-z]{2,})",
+                text,
+                flags=re.IGNORECASE,
+            )
+            if match:
+                return match.group(2).lower()
+        return None
+
+    def extract_undeliverable_recipient(body: str) -> Optional[str]:
+        if not body:
+            return None
+        patterns = [
+            r"Your message to\\s+([A-Za-z0-9._%+\\-]+@[A-Za-z0-9.\\-]+\\.[A-Za-z]{2,})\\s+couldn'?t be delivered",
+            r"Recipient\\s+([A-Za-z0-9._%+\\-]+@[A-Za-z0-9.\\-]+\\.[A-Za-z]{2,})\\s+not found",
+            r"Delivery to the following recipient[s] failed:\\s*([A-Za-z0-9._%+\\-]+@[A-Za-z0-9.\\-]+\\.[A-Za-z]{2,})",
+            r"could not be delivered to\\s+([A-Za-z0-9._%+\\-]+@[A-Za-z0-9.\\-]+\\.[A-Za-z]{2,})",
+        ]
+        for pat in patterns:
+            match = re.search(pat, body, flags=re.IGNORECASE)
+            if match:
+                return match.group(1).lower()
+        return None
+
+    def extract_undeliverable_from_message(msg: email.message.Message) -> Optional[str]:
+        for part in msg.walk():
+            ctype = part.get_content_type()
+            if ctype not in ("text/plain", "text/html"):
+                continue
+            payload = part.get_payload(decode=True)
+            if payload is None:
+                payload = part.get_payload()
+            if payload and (part.get("Content-Transfer-Encoding") or "").lower() == "quoted-printable":
+                payload = quopri.decodestring(payload)
+            if not payload:
+                continue
+            if isinstance(payload, (bytes, bytearray)):
+                text = payload.decode(errors="replace")
+            else:
+                text = str(payload)
+            text = re.sub(r"=\\r?\\n", "", text)
+            if ctype == "text/html":
+                text = BeautifulSoup(text, "html.parser").get_text(" ")
+            match = extract_undeliverable_recipient(text)
+            if match:
+                return match
+        return None
+
+    def extract_undeliverable_from_raw(raw_text: str) -> Optional[str]:
+        if not raw_text:
+            return None
+        patterns = [
+            r"Final-Recipient:\\s*[^;]+;\\s*([A-Za-z0-9._%+\\-]+@[A-Za-z0-9.\\-]+\\.[A-Za-z]{2,})",
+            r"Original-Recipient:\\s*[^;]+;\\s*([A-Za-z0-9._%+\\-]+@[A-Za-z0-9.\\-]+\\.[A-Za-z]{2,})",
+            r"Recipient Address:\\s*([A-Za-z0-9._%+\\-]+@[A-Za-z0-9.\\-]+\\.[A-Za-z]{2,})",
+            r"Your message to\\s+([A-Za-z0-9._%+\\-]+@[A-Za-z0-9.\\-]+\\.[A-Za-z]{2,})\\s+couldn'?t be delivered",
+        ]
+        for pat in patterns:
+            match = re.search(pat, raw_text, flags=re.IGNORECASE)
+            if match:
+                return match.group(1).lower()
+        return None
+
     def extract_body(msg: email.message.Message) -> str:
         text_body = None
         html_body = None
@@ -5986,22 +6154,33 @@ def import_survey_response_eml(args: argparse.Namespace) -> int:
                 if part.get_content_disposition() == "attachment":
                     continue
                 ctype = part.get_content_type()
+                payload = part.get_payload(decode=True)
+                if payload is None:
+                    payload = part.get_payload()
+                if payload and (part.get("Content-Transfer-Encoding") or "").lower() == "quoted-printable":
+                    payload = quopri.decodestring(payload)
                 if ctype == "text/plain" and text_body is None:
-                    text_body = part.get_payload(decode=True)
+                    text_body = payload if isinstance(payload, (bytes, bytearray)) else str(payload).encode()
                 elif ctype == "text/html" and html_body is None:
-                    html_body = part.get_payload(decode=True)
+                    html_body = payload if isinstance(payload, (bytes, bytearray)) else str(payload).encode()
         else:
             ctype = msg.get_content_type()
             payload = msg.get_payload(decode=True)
+            if payload is None:
+                payload = msg.get_payload()
+            if payload and (msg.get("Content-Transfer-Encoding") or "").lower() == "quoted-printable":
+                payload = quopri.decodestring(payload)
             if ctype == "text/plain":
-                text_body = payload
+                text_body = payload if isinstance(payload, (bytes, bytearray)) else str(payload).encode()
             elif ctype == "text/html":
-                html_body = payload
+                html_body = payload if isinstance(payload, (bytes, bytearray)) else str(payload).encode()
 
         if text_body:
-            return text_body.decode(errors="replace")
+            text = text_body.decode(errors="replace")
+            return re.sub(r"=\r?\n", "", text)
         if html_body:
             html_text = html_body.decode(errors="replace")
+            html_text = re.sub(r"=\r?\n", "", html_text)
             return BeautifulSoup(html_text, "html.parser").get_text(" ")
         return ""
 
@@ -6029,10 +6208,28 @@ def import_survey_response_eml(args: argparse.Namespace) -> int:
         cleaned = re.sub(r"[ \\t]+", " ", cleaned).strip()
         return cleaned
 
+    def is_auto_response(msg: email.message.Message, subject: str, body: str) -> bool:
+        auto_submitted = (msg.get("Auto-Submitted") or "").lower()
+        if "auto-replied" in auto_submitted or "auto-generated" in auto_submitted:
+            return True
+        if msg.get("X-Auto-Response-Suppress") or msg.get("X-Autoreply"):
+            return True
+        subj = (subject or "").lower()
+        for token in ["out of office", "automatic reply", "auto-reply", "autoreply", "vacation reply"]:
+            if token in subj:
+                return True
+        body_l = (body or "").lower()
+        for token in ["out of office", "automatic reply", "auto-reply", "autoreply", "vacation reply"]:
+            if token in body_l:
+                return True
+        return False
+
     conn = sqlite3.connect(db_path, timeout=10)
     conn.row_factory = sqlite3.Row
     configure_sqlite(conn)
     ensure_creator_surveys_table(conn)
+    ensure_survey_templates_table(conn)
+    ensure_creator_survey_status_table(conn)
     ensure_survey_responses_table(conn)
 
     files_scanned = 0
@@ -6044,6 +6241,17 @@ def import_survey_response_eml(args: argparse.Namespace) -> int:
     failures = 0
     confirmed_openai = False
 
+    def status_icon(code: int) -> str:
+        if code == 404:
+            return "🚫"
+        if code == 202:
+            return "🤖"
+        if code == 200:
+            return "✅"
+        if code == 100:
+            return "⏳"
+        return "ℹ️"
+
     for path in eml_paths:
         files_scanned += 1
         try:
@@ -6054,18 +6262,64 @@ def import_survey_response_eml(args: argparse.Namespace) -> int:
             continue
 
         sender_email = extract_sender_email(msg.get("From"))
+        raw_subject = msg.get("Subject") or ""
+        undeliverable = (
+            msg.get("X-MS-Exchange-Message-Is-Ndr") is not None
+            or raw_subject.lower().startswith("undeliverable:")
+            or (msg.get("Content-Type") or "").lower().startswith("multipart/report")
+        )
         if not sender_email:
             print(f"\033[33m⚠️ No sender email found for {path}\033[0m", file=sys.stderr)
             unmatched += 1
             continue
 
         received_at = parse_received_at(msg, path)
-        subject = (msg.get("Subject") or "").strip() or None
+        subject = raw_subject.strip() or None
         message_id = (msg.get("Message-ID") or "").strip() or None
         in_reply_to = (msg.get("In-Reply-To") or "").strip() or None
         raw_body = strip_quoted(extract_body(msg))
         if len(raw_body) > 12000:
             raw_body = raw_body[:12000]
+
+        auto_response = False if undeliverable else is_auto_response(msg, raw_subject, raw_body)
+        dsn_email = None
+        body_recipient = None
+        raw_recipient = None
+        if undeliverable:
+            dsn_email = extract_dsn_recipient(msg)
+            body_recipient = extract_undeliverable_recipient(raw_body)
+            if not body_recipient:
+                body_recipient = extract_undeliverable_from_message(msg)
+            if not dsn_email and not body_recipient:
+                raw_recipient = extract_undeliverable_from_raw(msg.as_string())
+            if dsn_email:
+                sender_email = dsn_email
+            elif body_recipient:
+                sender_email = body_recipient
+            elif raw_recipient:
+                sender_email = raw_recipient
+            else:
+                to_email = extract_sender_email(msg.get("To")) or ""
+                body_emails = extract_emails_from_text(raw_body)
+                pick = None
+                for candidate in body_emails:
+                    if candidate == sender_email:
+                        continue
+                    if to_email and candidate == to_email:
+                        continue
+                    pick = candidate
+                    break
+                if pick:
+                    sender_email = pick
+        if debug_eml:
+            part_types = ",".join([part.get_content_type() for part in msg.walk()])
+            print(
+                "🔎 eml debug "
+                f"file={path.name} undeliverable={undeliverable} "
+                f"dsn={dsn_email or ''} body_recipient={body_recipient or ''} raw_recipient={raw_recipient or ''} "
+                f"from={extract_sender_email(msg.get('From')) or ''} to={extract_sender_email(msg.get('To')) or ''} "
+                f"final={sender_email or ''} parts={part_types}"
+            )
 
         survey_row = conn.execute(
             """
@@ -6078,7 +6332,19 @@ def import_survey_response_eml(args: argparse.Namespace) -> int:
             (sender_email,),
         ).fetchone()
         if not survey_row:
-            print(f"\033[33m⚠️ No creator_survey match for {sender_email} ({path.name})\033[0m", file=sys.stderr)
+            detail = ""
+            if undeliverable:
+                candidates = [c for c in [dsn_email, body_recipient] if c]
+                if candidates:
+                    detail = f" (undeliverable candidates: {', '.join(candidates)})"
+                else:
+                    detail = " (undeliverable detected)"
+            elif auto_response:
+                detail = " (auto-response detected)"
+            print(
+                f"\033[33m⚠️ No creator_survey match for {sender_email} ({path.name}){detail}\033[0m",
+                file=sys.stderr,
+            )
             unmatched += 1
             continue
         matched += 1
@@ -6114,60 +6380,76 @@ def import_survey_response_eml(args: argparse.Namespace) -> int:
             )
             updated += 1
 
-        if not confirmed_openai:
-            confirmed_openai = ensure_openai_confirmation("survey response parsing", allow_fallback=False)
-            if not confirmed_openai:
-                print("\033[33m⚠️ OpenAI confirmation declined. Stopping import.\033[0m", file=sys.stderr)
-                conn.commit()
-                conn.close()
-                print(
-                    f"Files scanned: {files_scanned}; matched: {matched}; unmatched: {unmatched}; "
-                    f"inserted: {inserted}; updated: {updated}; openai_calls: {openai_calls}; failures: {failures}"
-                )
-                return 0
-
         parsed_fields = None
         qa_fields = None
-        try:
-            key = os.getenv("OPENAI_API_KEY")
-            if not key:
-                raise RuntimeError("OPENAI_API_KEY not set")
-            client = OpenAI(api_key=key)
-            prompt_1 = (
-                "Extract structured signals from the email reply.\n"
-                "Return strict JSON with keys:\n"
-                "intent (answered|interested|not_interested|questions|unsubscribe|out_of_office|unclear),\n"
-                "confidence (0..1), summary, signals (mentions_pricing, mentions_sponsors, mentions_agency_or_network, language, country_hint, followup_recommended),\n"
-                "entities (podcast_name_guess, host_name_guess, urls, emails).\n\n"
-                f"Email body:\\n{raw_body}"
-            )
-            resp = client.chat.completions.create(
-                model=SURVEY_RESPONSE_MODEL,
-                messages=[{"role": "user", "content": prompt_1}],
-                temperature=0.2,
-                response_format={"type": "json_object"},
-            )
-            parsed_fields = json.loads(resp.choices[0].message.content)
-            openai_calls += 1
+        status_code = 404 if undeliverable else (202 if auto_response else 200)
+        upsert_creator_survey_status(conn, survey_row["id"], status_code)
+        print(f"{status_icon(status_code)} status={status_code} email={sender_email} file={path.name}")
+        if undeliverable:
+            parsed_fields = {
+                "intent": "undeliverable",
+                "confidence": 1.0,
+                "summary": "Delivery failed (undeliverable).",
+            }
+        elif auto_response:
+            parsed_fields = {
+                "intent": "out_of_office",
+                "confidence": 0.8,
+                "summary": "Auto-response detected.",
+            }
+        else:
+            if not confirmed_openai:
+                confirmed_openai = ensure_openai_confirmation("survey response parsing", allow_fallback=False)
+                if not confirmed_openai:
+                    print("\033[33m⚠️ OpenAI confirmation declined. Stopping import.\033[0m", file=sys.stderr)
+                    conn.commit()
+                    conn.close()
+                    print(
+                        f"Files scanned: {files_scanned}; matched: {matched}; unmatched: {unmatched}; "
+                        f"inserted: {inserted}; updated: {updated}; openai_calls: {openai_calls}; failures: {failures}"
+                    )
+                    return 0
 
-            prompt_2 = (
-                "Map the email reply to survey answers. Return strict JSON with:\n"
-                "answers object containing: monetisation_status, biggest_challenges (array), relevance_value, formats_of_interest (array), open_comment, price_band,\n"
-                "confidence_by_field object.\n"
-                "Infer best-fit answers; if missing, return null and low confidence.\n\n"
-                f"Email body:\\n{raw_body}"
-            )
-            resp2 = client.chat.completions.create(
-                model=SURVEY_RESPONSE_MODEL,
-                messages=[{"role": "user", "content": prompt_2}],
-                temperature=0.2,
-                response_format={"type": "json_object"},
-            )
-            qa_fields = json.loads(resp2.choices[0].message.content)
-            openai_calls += 1
-        except Exception as exc:
-            print(f"\033[33m⚠️ OpenAI parse failed for {path}: {exc}\033[0m", file=sys.stderr)
-            failures += 1
+            try:
+                key = os.getenv("OPENAI_API_KEY")
+                if not key:
+                    raise RuntimeError("OPENAI_API_KEY not set")
+                client = OpenAI(api_key=key)
+                prompt_1 = (
+                    "Extract structured signals from the email reply.\n"
+                    "Return strict JSON with keys:\n"
+                    "intent (answered|interested|not_interested|questions|unsubscribe|out_of_office|unclear),\n"
+                    "confidence (0..1), summary, signals (mentions_pricing, mentions_sponsors, mentions_agency_or_network, language, country_hint, followup_recommended),\n"
+                    "entities (podcast_name_guess, host_name_guess, urls, emails).\n\n"
+                    f"Email body:\\n{raw_body}"
+                )
+                resp = client.chat.completions.create(
+                    model=SURVEY_RESPONSE_MODEL,
+                    messages=[{"role": "user", "content": prompt_1}],
+                    temperature=0.2,
+                    response_format={"type": "json_object"},
+                )
+                parsed_fields = json.loads(resp.choices[0].message.content)
+                openai_calls += 1
+
+                prompt_2 = (
+                    "Map the email reply to survey answers. Return strict JSON with:\n"
+                    "answers object containing: monetisation_status, biggest_challenges (array), relevance_value, formats_of_interest (array), open_comment, price_band,\n"
+                    "confidence_by_field object.\n"
+                    "Infer best-fit answers; if missing, return null and low confidence.\n\n"
+                    f"Email body:\\n{raw_body}"
+                )
+                resp2 = client.chat.completions.create(
+                    model=SURVEY_RESPONSE_MODEL,
+                    messages=[{"role": "user", "content": prompt_2}],
+                    temperature=0.2,
+                    response_format={"type": "json_object"},
+                )
+                qa_fields = json.loads(resp2.choices[0].message.content)
+                openai_calls += 1
+            except Exception as exc:
+                print(f"\033[33m⚠️ OpenAI parse failed for {path}: {exc}\033[0m", file=sys.stderr)
+                failures += 1
 
         try:
             conn.execute(
@@ -6209,6 +6491,32 @@ def import_survey_response_eml(args: argparse.Namespace) -> int:
         f"inserted_survey_responses={inserted}, updated_creator_surveys={updated}, "
         f"openai_calls_made={openai_calls}, failures={failures}"
     )
+    return 0
+
+
+def survey_status_counts(args: argparse.Namespace) -> int:
+    db_path = Path(args.adl_db)
+    if not db_path.exists():
+        print(f"❌ DB not found: {db_path}", file=sys.stderr)
+        return 1
+    conn = sqlite3.connect(db_path, timeout=10)
+    conn.row_factory = sqlite3.Row
+    configure_sqlite(conn)
+    ensure_creator_survey_status_table(conn)
+    rows = conn.execute(
+        """
+        SELECT status_code, COUNT(*) AS count
+        FROM creator_survey_status
+        GROUP BY status_code
+        ORDER BY count DESC, status_code DESC
+        """
+    ).fetchall()
+    conn.close()
+    if not rows:
+        print("No creator_survey_status rows found.")
+        return 0
+    table_rows = [(r["status_code"], r["count"]) for r in rows]
+    print(format_table(table_rows, ("status_code", "count")))
     return 0
 
 
@@ -6607,6 +6915,19 @@ def parse_args(argv: Optional[Sequence[str]] = None) -> argparse.Namespace:
         "--auto-norm",
         action="store_true",
         help="Normalize creators as they are enriched (writes entity_normalized + creators.normalized_*)",
+    )
+
+    survey_parser = subparsers.add_parser("survey", help="Survey reporting utilities")
+    survey_parser.add_argument(
+        "--adl-db",
+        type=Path,
+        default=Path("adelined_matching.db"),
+        help="Path to Adelined SQLite database (default: adelined_matching.db)",
+    )
+    survey_parser.add_argument(
+        "--count-by-status",
+        action="store_true",
+        help="Show creator survey counts by status code",
     )
 
     discover_parser = subparsers.add_parser("discover", help="Discover new creators from external sources")
@@ -7121,6 +7442,24 @@ def parse_args(argv: Optional[Sequence[str]] = None) -> argparse.Namespace:
         help="Directory of .eml files (required for survey-response-eml)",
     )
     import_parser.add_argument(
+        "--limit",
+        type=int,
+        help="Limit number of .eml files to process (survey-response-eml)",
+    )
+    import_parser.add_argument(
+        "--filter",
+        help="Substring filter to match .eml filenames (survey-response-eml)",
+    )
+    import_parser.add_argument(
+        "--debug",
+        action="store_true",
+        help="Print debug details for .eml parsing (survey-response-eml)",
+    )
+    import_parser.add_argument(
+        "--gdrive-folder-url",
+        help="Public Google Drive folder URL containing .eml files (survey-response-eml)",
+    )
+    import_parser.add_argument(
         "--sheet-url",
         help="Google Sheet URL (optional for email-survey)",
     )
@@ -7306,6 +7645,11 @@ def main(argv: Optional[Sequence[str]] = None) -> int:
             return ingest_apple_discovery(args)
     if args.action == "enrich":
         return enrich_creators(args)
+    if args.action == "survey":
+        if args.count_by_status:
+            return survey_status_counts(args)
+        print("❌ Please provide --count-by-status for survey", file=sys.stderr)
+        return 1
     if args.action == "enrichment":
         if args.enrichment_action == "clear":
             return clear_enrichment(args)
@@ -7344,8 +7688,8 @@ def main(argv: Optional[Sequence[str]] = None) -> int:
                 return 1
             return import_email_survey(args)
         if args.type == "survey-response-eml":
-            if not getattr(args, "dir", None):
-                print("❌ --dir is required for import --type survey-response-eml", file=sys.stderr)
+            if not getattr(args, "dir", None) and not getattr(args, "gdrive_folder_url", None):
+                print("❌ --dir or --gdrive-folder-url is required for import --type survey-response-eml", file=sys.stderr)
                 return 1
             return import_survey_response_eml(args)
     if args.action == "compare-creators":
