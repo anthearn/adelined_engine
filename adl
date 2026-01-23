@@ -6066,6 +6066,13 @@ def import_survey_response_eml(args: argparse.Namespace) -> int:
                 continue
             payload = part.get_payload()
             if isinstance(payload, list):
+                for item in payload:
+                    if hasattr(item, "get"):
+                        final_recipient = item.get("Final-Recipient")
+                        if final_recipient:
+                            target = final_recipient.split(";")[-1].strip()
+                            if target:
+                                return target.lower()
                 chunks = []
                 for item in payload:
                     if hasattr(item, "as_string"):
@@ -6294,10 +6301,10 @@ def import_survey_response_eml(args: argparse.Namespace) -> int:
                 raw_recipient = extract_undeliverable_from_raw(msg.as_string())
             if dsn_email:
                 sender_email = dsn_email
-            elif body_recipient:
-                sender_email = body_recipient
             elif raw_recipient:
                 sender_email = raw_recipient
+            elif body_recipient:
+                sender_email = body_recipient
             else:
                 to_email = extract_sender_email(msg.get("To")) or ""
                 body_emails = extract_emails_from_text(raw_body)
