@@ -7,3 +7,6 @@ __pycache__/
 cache/
 tests/
 midrollv0/
+.DS_Store
+adl-env/
+temp/

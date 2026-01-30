@@ -18,12 +18,13 @@ import time
 import email
 import quopri
 import subprocess
+from urllib.parse import urlparse
 from email import policy
 from email.utils import getaddresses, parsedate_to_datetime
 from dataclasses import dataclass
 from datetime import datetime, timedelta
 from pathlib import Path
-from typing import Dict, Iterable, List, Optional, Sequence, Tuple
+from typing import Any, Dict, Iterable, List, Optional, Sequence, Tuple
 
 import requests
 from bs4 import BeautifulSoup
@@ -44,6 +45,105 @@ LLM_PROVIDER_EMBED = "LLM_PROVIDER_EMBED"
 PODSCAN_API_BASE = "https://podscan.fm/api/v1"
 SURVEY_RESPONSE_PROMPT_VERSION = "v1"
 SURVEY_RESPONSE_MODEL = "gpt-4o-mini"
+GEMINI_MODEL_DEFAULT = "gemini-2.5-flash-lite"
+
+
+class GeminiClient:
+    def __init__(self, api_key: str, model_name: str = GEMINI_MODEL_DEFAULT):
+        try:
+            from google import genai  # type: ignore
+            from google.genai import types  # type: ignore
+        except Exception as exc:
+            raise RuntimeError("google-genai is required for Gemini support") from exc
+        self._client = genai.Client(api_key=api_key)
+        self.model_name = model_name
+        self._types = types
+
+    def generate_json_with_schema(
+        self,
+        prompt: str,
+        response_schema: Dict[str, Any],
+        summary_instruction: str,
+    ) -> Dict[str, Any]:
+        search_response = self._client.models.generate_content(
+            model=self.model_name,
+            contents=f"{summary_instruction}\n\n{prompt}",
+            config=self._types.GenerateContentConfig(
+                tools=[self._types.Tool(google_search=self._types.GoogleSearch())],
+                response_mime_type="text/plain",
+                max_output_tokens=2048,
+            ),
+        )
+        search_text = (getattr(search_response, "text", "") or "").strip()
+        grounding = None
+        try:
+            if getattr(search_response, "candidates", None):
+                grounding = getattr(search_response.candidates[0], "grounding_metadata", None)
+        except Exception:
+            grounding = None
+        if not search_text and grounding:
+            search_text = f"Search data found. Metadata: {grounding}"
+        if not search_text:
+            raise RuntimeError("Gemini search returned no text or metadata")
+
+        format_response = self._client.models.generate_content(
+            model=self.model_name,
+            contents=(
+                "Extract structured data from these findings. Return JSON ONLY.\n\n"
+                f"Findings:\n{search_text}\n\n"
+                f"Context: {prompt}"
+            ),
+            config=self._types.GenerateContentConfig(
+                response_mime_type="application/json",
+                response_schema=response_schema,
+            ),
+        )
+        text = getattr(format_response, "text", "") or ""
+        if not text:
+            raise RuntimeError("Gemini response had no text")
+        try:
+            return json.loads(text)
+        except json.JSONDecodeError as exc:
+            raise RuntimeError(f"Gemini returned invalid JSON: {text[:200]}") from exc
+
+    def generate_json(self, prompt: str) -> Dict[str, Any]:
+        response_schema = {
+            "type": "object",
+            "properties": {
+                "recovery_details": {
+                    "type": "object",
+                    "properties": {
+                        "verified_email": {"type": "string"},
+                        "contact_form_url": {"type": "string"},
+                        "host_name": {"type": "string"},
+                        "social_handles": {
+                            "type": "object",
+                            "properties": {
+                                "instagram": {"type": "string"},
+                                "linkedin": {"type": "string"},
+                            },
+                        },
+                        "podcast_status": {"type": "string", "enum": ["active", "inactive"]},
+                        "confidence_score": {"type": "number"},
+                    },
+                    "required": ["verified_email", "host_name", "confidence_score"],
+                },
+                "search_context": {
+                    "type": "object",
+                    "properties": {
+                        "found_via": {"type": "string"},
+                        "summary": {"type": "string"},
+                    },
+                    "required": ["found_via", "summary"],
+                },
+            },
+            "required": ["recovery_details", "search_context"],
+        }
+        summary_instruction = (
+            "Use Google Search to find the most current primary contact details. "
+            "Return a concise plain-text summary of the evidence with sources."
+        )
+        return self.generate_json_with_schema(prompt, response_schema, summary_instruction)
 
 
 def resolve_llm_provider(env_var: str, default: str) -> str:
@@ -731,6 +831,56 @@ def ensure_creator_survey_status_table(conn: sqlite3.Connection) -> None:
     )
 
 
+def ensure_creator_meta_table(conn: sqlite3.Connection) -> None:
+    conn.execute(
+        """
+        CREATE TABLE IF NOT EXISTS creator_meta (
+            adlid INTEGER PRIMARY KEY,
+            verified_email TEXT,
+            contact_form_url TEXT,
+            source_email TEXT,
+            gemini_data TEXT,
+            confidence REAL,
+            model_version TEXT,
+            last_lookup_at DATETIME,
+            FOREIGN KEY (adlid) REFERENCES creators(adlid)
+        )
+        """
+    )
+    ensure_column(conn, "creator_meta", "verified_email", "TEXT")
+    ensure_column(conn, "creator_meta", "contact_form_url", "TEXT")
+    ensure_column(conn, "creator_meta", "source_email", "TEXT")
+    ensure_column(conn, "creator_meta", "gemini_data", "TEXT")
+    ensure_column(conn, "creator_meta", "confidence", "REAL")
+    ensure_column(conn, "creator_meta", "model_version", "TEXT")
+    ensure_column(conn, "creator_meta", "last_lookup_at", "DATETIME")
+
+
+def ensure_socials_table(conn: sqlite3.Connection) -> None:
+    conn.execute(
+        """
+        CREATE TABLE IF NOT EXISTS socials (
+            id INTEGER PRIMARY KEY AUTOINCREMENT,
+            creator_adlid INTEGER NOT NULL,
+            platform TEXT,
+            handle TEXT,
+            reach INTEGER,
+            last_post TEXT,
+            status INTEGER DEFAULT 100,
+            source_url TEXT,
+            created_at DATETIME DEFAULT CURRENT_TIMESTAMP,
+            updated_at DATETIME DEFAULT CURRENT_TIMESTAMP,
+            FOREIGN KEY (creator_adlid) REFERENCES creators(adlid)
+        )
+        """
+    )
+    conn.execute(
+        """
+        CREATE INDEX IF NOT EXISTS idx_socials_creator_platform
+        ON socials(creator_adlid, platform)
+        """
+    )
+
 def ensure_survey_responses_table(conn: sqlite3.Connection) -> None:
     conn.execute(
         """
@@ -960,8 +1110,26 @@ def ensure_apple_categories_table(conn: sqlite3.Connection) -> None:
         )
         """
     )
+    ensure_column(conn, "apple_podcast_categories", "slug_apple_id", "TEXT")
     conn.execute(
         "CREATE INDEX IF NOT EXISTS idx_apple_cat_parent ON apple_podcast_categories(parent_apple_id)"
+    )
+
+def ensure_supabase_categories_table(conn: sqlite3.Connection) -> None:
+    conn.execute(
+        """
+        CREATE TABLE IF NOT EXISTS podcast_categories (
+            id TEXT PRIMARY KEY,
+            slug_apple_id TEXT,
+            label TEXT,
+            color_hex TEXT,
+            parent TEXT,
+            path TEXT
+        )
+        """
+    )
+    conn.execute(
+        "CREATE INDEX IF NOT EXISTS idx_podcast_categories_slug ON podcast_categories(slug_apple_id)"
     )
 
 def ensure_creator_topics_table(conn: sqlite3.Connection) -> None:
@@ -3431,6 +3599,32 @@ def load_static(args: argparse.Namespace) -> int:
             inserted += 1
         conn.commit()
         print(f"✅ Loaded {inserted} Apple podcast categories.")
+    elif getattr(args, "supabase_categories", False):
+        ensure_supabase_categories_table(conn)
+        ensure_apple_categories_table(conn)
+        sql_path = Path("data") / "podcast_categories_rows.sql"
+        if not sql_path.exists():
+            print(f"❌ Missing data file: {sql_path}", file=sys.stderr)
+            conn.close()
+            return 1
+        raw_sql = sql_path.read_text()
+        raw_sql = raw_sql.replace('"public"."podcast_categories"', "podcast_categories")
+        conn.executescript(raw_sql)
+        conn.execute(
+            """
+            UPDATE apple_podcast_categories
+            SET slug_apple_id = (
+                SELECT pc.slug_apple_id
+                FROM podcast_categories pc
+                WHERE LOWER(pc.path) = LOWER(apple_podcast_categories.full_path)
+                   OR LOWER(pc.label) = LOWER(apple_podcast_categories.name)
+                LIMIT 1
+            )
+            WHERE slug_apple_id IS NULL
+            """
+        )
+        conn.commit()
+        print("✅ Loaded Supabase podcast_categories and updated apple_podcast_categories.slugs.")
     else:
         print("Nothing to load.")
     conn.close()
@@ -3473,18 +3667,21 @@ def assign_creator_topics(args: argparse.Namespace) -> int:
             print("Aborted.")
             conn.close()
             return 1
+        podscan_join = "JOIN podscan ps ON ps.podcastindex_id = c.podcastindex_id" if args.podscan_only else ""
         total_candidates = conn.execute(
-            """
+            f"""
             SELECT COUNT(*) FROM creators c
+            {podscan_join}
             WHERE NOT EXISTS (SELECT 1 FROM creator_topics ct WHERE ct.podcastindex_id = c.podcastindex_id)
             """
         ).fetchone()[0]
         creators = conn.execute(
-            """
+            f"""
             SELECT c.podcastindex_id, c.title, c.description,
                    pf.title as feed_title, pf.description as feed_description,
                    pf.category1, pf.category2, pf.category3, pf.category4, pf.category5
             FROM creators c
+            {podscan_join}
             LEFT JOIN podcastindex_feeds pf ON pf.id = c.podcastindex_id
             WHERE NOT EXISTS (
                 SELECT 1 FROM creator_topics ct WHERE ct.podcastindex_id = c.podcastindex_id
@@ -3492,18 +3689,21 @@ def assign_creator_topics(args: argparse.Namespace) -> int:
             """
         ).fetchall()
     else:
+        podscan_join = "JOIN podscan ps ON ps.podcastindex_id = c.podcastindex_id" if args.podscan_only else ""
         total_candidates = conn.execute(
-            """
+            f"""
             SELECT COUNT(*) FROM creators c
+            {podscan_join}
             WHERE NOT EXISTS (SELECT 1 FROM creator_topics ct WHERE ct.podcastindex_id = c.podcastindex_id)
             """
         ).fetchone()[0]
         creators = conn.execute(
-            """
+            f"""
             SELECT c.podcastindex_id, c.title, c.description,
                    pf.title as feed_title, pf.description as feed_description,
                    pf.category1, pf.category2, pf.category3, pf.category4, pf.category5
             FROM creators c
+            {podscan_join}
             LEFT JOIN podcastindex_feeds pf ON pf.id = c.podcastindex_id
             WHERE NOT EXISTS (
                 SELECT 1 FROM creator_topics ct WHERE ct.podcastindex_id = c.podcastindex_id
@@ -4564,6 +4764,10 @@ def update_from_podscan(args: argparse.Namespace) -> int:
         "region": region,
         "min_last_episode_posted_at": min_last_episode,
     }
+    if getattr(args, "title", None):
+        params["q"] = args.title
+        params["query"] = args.title
+        params["title"] = args.title
     if max_last_episode:
         params["max_last_episode_posted_at"] = max_last_episode
 
@@ -4602,38 +4806,45 @@ def update_from_podscan(args: argparse.Namespace) -> int:
                 if limit != 0 and stored >= limit:
                     break
                 email, website = extract_podscan_contact(podcast)
-                verb = "INSERT OR REPLACE" if args.force else "INSERT OR IGNORE"
-                conn.execute(
-                    f"""
-                    {verb} INTO podscan
-                        (id, guid, podcastindex_id, itunesid, email, website, full_json, region)
-                    VALUES (?, ?, ?, ?, ?, ?, ?, ?)
-                    """,
-                    (
-                        podcast.get("podcast_id"),
-                        podcast.get("podcast_guid"),
-                        None,
-                        podcast.get("podcast_itunes_id"),
-                        email,
-                        website,
-                        json.dumps(podcast, ensure_ascii=True),
-                        podcast.get("region"),
-                    ),
-                )
+                if args.dry_run:
+                    print(json.dumps(podcast, indent=2, ensure_ascii=True))
+                    print("-" * 60)
+                else:
+                    verb = "INSERT OR REPLACE" if args.force else "INSERT OR IGNORE"
+                    conn.execute(
+                        f"""
+                        {verb} INTO podscan
+                            (id, guid, podcastindex_id, itunesid, email, website, full_json, region)
+                        VALUES (?, ?, ?, ?, ?, ?, ?, ?)
+                        """,
+                        (
+                            podcast.get("podcast_id"),
+                            podcast.get("podcast_guid"),
+                            None,
+                            podcast.get("podcast_itunes_id"),
+                            email,
+                            website,
+                            json.dumps(podcast, ensure_ascii=True),
+                            podcast.get("region"),
+                        ),
+                    )
                 stored += 1
 
             if total_pages is not None and page >= total_pages:
                 break
             page += 1
 
-        conn.commit()
-        print(
-            "✅ Stored {count} Podscan records (region=GB, min_last_episode_posted_at={min_date}{max_suffix}).".format(
-                count=stored,
-                min_date=min_last_episode,
-                max_suffix=f', max_last_episode_posted_at={max_last_episode}' if max_last_episode else "",
+        if not args.dry_run:
+            conn.commit()
+            print(
+                "✅ Stored {count} Podscan records (region=GB, min_last_episode_posted_at={min_date}{max_suffix}).".format(
+                    count=stored,
+                    min_date=min_last_episode,
+                    max_suffix=f', max_last_episode_posted_at={max_last_episode}' if max_last_episode else "",
+                )
             )
-        )
+        else:
+            print(f"✅ Dry run complete. Fetched {stored} Podscan records.")
         return 0
     finally:
         conn.close()
@@ -6014,7 +6225,14 @@ def import_survey_response_eml(args: argparse.Namespace) -> int:
             return 1
         download_dir = Path("tests") / "gdrive_eml_import"
         download_dir.mkdir(parents=True, exist_ok=True)
-        gdown.download_folder(url=gdrive_url, output=str(download_dir), quiet=True, use_cookies=False)
+        gdown.download_folder(
+            url=gdrive_url,
+            output=str(download_dir),
+            quiet=True,
+            use_cookies=False,
+            remaining_ok=True,
+            recursive=not bool(getattr(args, "no_recurse", False)),
+        )
         eml_dir = download_dir
     if not eml_dir:
         print("❌ --dir or --gdrive-folder-url is required for survey-response-eml", file=sys.stderr)
@@ -6107,9 +6325,10 @@ def import_survey_response_eml(args: argparse.Namespace) -> int:
             r"Recipient\\s+([A-Za-z0-9._%+\\-]+@[A-Za-z0-9.\\-]+\\.[A-Za-z]{2,})\\s+not found",
             r"Delivery to the following recipient[s] failed:\\s*([A-Za-z0-9._%+\\-]+@[A-Za-z0-9.\\-]+\\.[A-Za-z]{2,})",
             r"could not be delivered to\\s+([A-Za-z0-9._%+\\-]+@[A-Za-z0-9.\\-]+\\.[A-Za-z]{2,})",
+            r"Delivery has failed to these recipients or groups:.*?([A-Za-z0-9._%+\\-]+@[A-Za-z0-9.\\-]+\\.[A-Za-z]{2,})",
         ]
         for pat in patterns:
-            match = re.search(pat, body, flags=re.IGNORECASE)
+            match = re.search(pat, body, flags=re.IGNORECASE | re.DOTALL)
             if match:
                 return match.group(1).lower()
         return None
@@ -6231,6 +6450,24 @@ def import_survey_response_eml(args: argparse.Namespace) -> int:
                 return True
         return False
 
+    def is_sender_blocked(msg: email.message.Message, body: str, raw_text: str) -> bool:
+        haystack = " ".join(
+            [
+                (msg.get("Subject") or ""),
+                body or "",
+                raw_text or "",
+            ]
+        ).lower()
+        patterns = [
+            "bad outbound sender",
+            "access denied, bad outbound sender",
+            "as(42004)",
+            "sender blocked",
+            "blocked for spam",
+            "anti-spam",
+        ]
+        return any(pat in haystack for pat in patterns)
+
     conn = sqlite3.connect(db_path, timeout=10)
     conn.row_factory = sqlite3.Row
     configure_sqlite(conn)
@@ -6251,6 +6488,8 @@ def import_survey_response_eml(args: argparse.Namespace) -> int:
     def status_icon(code: int) -> str:
         if code == 404:
             return "🚫"
+        if code == 451:
+            return "⛔"
         if code == 202:
             return "🤖"
         if code == 200:
@@ -6284,11 +6523,14 @@ def import_survey_response_eml(args: argparse.Namespace) -> int:
         subject = raw_subject.strip() or None
         message_id = (msg.get("Message-ID") or "").strip() or None
         in_reply_to = (msg.get("In-Reply-To") or "").strip() or None
+        raw_message = msg.as_string()
         raw_body = strip_quoted(extract_body(msg))
         if len(raw_body) > 12000:
             raw_body = raw_body[:12000]
 
         auto_response = False if undeliverable else is_auto_response(msg, raw_subject, raw_body)
+        sender_blocked = is_sender_blocked(msg, raw_body, raw_message) if undeliverable else False
+        to_email = extract_sender_email(msg.get("To")) or ""
         dsn_email = None
         body_recipient = None
         raw_recipient = None
@@ -6298,26 +6540,27 @@ def import_survey_response_eml(args: argparse.Namespace) -> int:
             if not body_recipient:
                 body_recipient = extract_undeliverable_from_message(msg)
             if not dsn_email and not body_recipient:
-                raw_recipient = extract_undeliverable_from_raw(msg.as_string())
+                raw_recipient = extract_undeliverable_from_raw(raw_message)
             if dsn_email:
                 sender_email = dsn_email
+            elif sender_blocked and to_email:
+                sender_email = to_email
             elif raw_recipient:
                 sender_email = raw_recipient
             elif body_recipient:
                 sender_email = body_recipient
             else:
-                to_email = extract_sender_email(msg.get("To")) or ""
                 body_emails = extract_emails_from_text(raw_body)
                 pick = None
                 for candidate in body_emails:
                     if candidate == sender_email:
                         continue
-                    if to_email and candidate == to_email:
-                        continue
                     pick = candidate
                     break
                 if pick:
                     sender_email = pick
+                elif to_email:
+                    sender_email = to_email
         if debug_eml:
             part_types = ",".join([part.get_content_type() for part in msg.walk()])
             print(
@@ -6346,6 +6589,8 @@ def import_survey_response_eml(args: argparse.Namespace) -> int:
                     detail = f" (undeliverable candidates: {', '.join(candidates)})"
                 else:
                     detail = " (undeliverable detected)"
+                if sender_blocked:
+                    detail = detail.rstrip(")") + "; sender blocked)"
             elif auto_response:
                 detail = " (auto-response detected)"
             print(
@@ -6390,9 +6635,17 @@ def import_survey_response_eml(args: argparse.Namespace) -> int:
         parsed_fields = None
         qa_fields = None
         status_code = 404 if undeliverable else (202 if auto_response else 200)
+        if sender_blocked:
+            status_code = 451
         upsert_creator_survey_status(conn, survey_row["id"], status_code)
         print(f"{status_icon(status_code)} status={status_code} email={sender_email} file={path.name}")
-        if undeliverable:
+        if sender_blocked:
+            parsed_fields = {
+                "intent": "sender_blocked",
+                "confidence": 1.0,
+                "summary": "Delivery blocked due to sender reputation/spam filter.",
+            }
+        elif undeliverable:
             parsed_fields = {
                 "intent": "undeliverable",
                 "confidence": 1.0,
@@ -6498,6 +6751,877 @@ def import_survey_response_eml(args: argparse.Namespace) -> int:
         f"inserted_survey_responses={inserted}, updated_creator_surveys={updated}, "
         f"openai_calls_made={openai_calls}, failures={failures}"
     )
+    return 0
+
+
+def recover_404s(args: argparse.Namespace) -> int:
+    db_path = Path(args.adl_db)
+    if not db_path.exists():
+        print(f"❌ DB not found: {db_path}", file=sys.stderr)
+        return 1
+
+    api_key = os.getenv("GEMINI_API_KEY")
+    if not api_key and not args.dry_run:
+        print("❌ GEMINI_API_KEY not set", file=sys.stderr)
+        return 1
+
+    conn = sqlite3.connect(db_path, timeout=10)
+    conn.row_factory = sqlite3.Row
+    configure_sqlite(conn)
+    ensure_creator_surveys_table(conn)
+    ensure_creator_survey_status_table(conn)
+    ensure_creator_meta_table(conn)
+
+    limit = args.limit
+    offset = args.offset
+    only_id = getattr(args, "only_id", None)
+
+    rows = conn.execute(
+        """
+        SELECT css.creator_survey_id,
+               cs.creator_adlid,
+               cs.email AS source_email,
+               COALESCE(pf.title, c.title, '') AS title
+        FROM creator_survey_status css
+        JOIN creator_surveys cs ON cs.id = css.creator_survey_id
+        JOIN creators c ON c.adlid = cs.creator_adlid
+        LEFT JOIN podcastindex_feeds pf ON pf.id = c.podcastindex_id
+        LEFT JOIN creator_meta cm ON cm.adlid = cs.creator_adlid
+        WHERE css.status_code = 404
+          AND cm.adlid IS NULL
+          AND (? IS NULL OR cs.creator_adlid = ?)
+        ORDER BY cs.id
+        LIMIT ? OFFSET ?
+        """,
+        (only_id, only_id, limit, offset),
+    ).fetchall()
+
+    if not rows:
+        print("No 404 survey rows found.")
+        conn.close()
+        return 0
+
+    client = None
+    if not args.dry_run:
+        try:
+            client = GeminiClient(api_key=api_key)
+        except Exception as exc:
+            print(f"❌ Gemini init failed: {exc}", file=sys.stderr)
+            conn.close()
+            return 1
+
+    processed = 0
+    updated = 0
+    skipped = 0
+    failures = 0
+
+    for idx, row in enumerate(rows):
+        adlid = row["creator_adlid"]
+        source_email = (row["source_email"] or "").strip()
+        title = (row["title"] or "").strip()
+        title = title or "Unknown podcast"
+
+        existing = conn.execute(
+            "SELECT adlid, last_lookup_at FROM creator_meta WHERE adlid = ?",
+            (adlid,),
+        ).fetchone()
+        if existing and not args.dry_run:
+            skipped += 1
+            continue
+
+        if args.dry_run:
+            print(f"DRY RUN: recover adlid={adlid} title=\"{title}\" email={source_email}")
+            processed += 1
+            continue
+
+        prompt = (
+            "Role: You are a Lead Generation and Contact Verification agent for a podcast sponsorship platform.\n"
+            "Task: Use Google Search to find the most current and valid primary contact information for a specific podcast.\n\n"
+            "Constraint Checklist:\n"
+            "1. JSON Only: Your output must be a single, valid JSON object. No conversational filler.\n"
+            "2. Verified Email: Priority sequence for email: Official Website > Latest Episode Notes > YouTube About Page > Host social bios (LinkedIn/Instagram).\n"
+            "3. Contact Form: If no email exists but a contact form is available, return its URL in contact_form_url.\n"
+            "4. Suffix Removal: If you find an address with a \"+\" suffix (e.g., contact+podcast@), strip the suffix to find the base mailbox (contact@) unless it is a system-proxy (like @anchor.fm).\n"
+            "5. Confidence Score: Assign a value from 0.0 to 1.0 based on how certain you are that the email belongs to the specific host or show.\n"
+            "6. No Hallucinations: If no valid email is found, return null for that field.\n\n"
+            f"Podcast title: {title}\n"
+            f"Bounced email: {source_email}\n"
+        )
+
+        try:
+            payload = client.generate_json(prompt)
+            recovery = payload.get("recovery_details", {}) if isinstance(payload, dict) else {}
+            verified_email = recovery.get("verified_email") if isinstance(recovery, dict) else None
+            contact_form_url = recovery.get("contact_form_url") if isinstance(recovery, dict) else None
+            host_name = recovery.get("host_name") if isinstance(recovery, dict) else None
+            confidence = recovery.get("confidence_score") if isinstance(recovery, dict) else None
+
+            if not verified_email and host_name:
+                followup_prompt = (
+                    "Role: You are a Lead Generation and Contact Verification agent for a podcast sponsorship platform.\n"
+                    "Task: Find the most current business email for the host named below, based on public sources.\n"
+                    "Return JSON only.\n\n"
+                    f"Host name: {host_name}\n"
+                    f"Podcast title: {title}\n"
+                    f"Previous bounced email: {source_email}\n"
+                )
+                payload = client.generate_json(followup_prompt)
+                recovery = payload.get("recovery_details", {}) if isinstance(payload, dict) else {}
+                verified_email = recovery.get("verified_email") if isinstance(recovery, dict) else None
+                contact_form_url = recovery.get("contact_form_url") if isinstance(recovery, dict) else None
+                confidence = recovery.get("confidence_score") if isinstance(recovery, dict) else None
+
+            conn.execute(
+                """
+                INSERT INTO creator_meta (
+                    adlid, verified_email, contact_form_url, source_email, gemini_data, confidence, model_version, last_lookup_at
+                ) VALUES (?, ?, ?, ?, ?, ?, ?, CURRENT_TIMESTAMP)
+                ON CONFLICT(adlid) DO UPDATE SET
+                    verified_email = excluded.verified_email,
+                    contact_form_url = excluded.contact_form_url,
+                    source_email = excluded.source_email,
+                    gemini_data = excluded.gemini_data,
+                    confidence = excluded.confidence,
+                    model_version = excluded.model_version,
+                    last_lookup_at = CURRENT_TIMESTAMP
+                """,
+                (
+                    adlid,
+                    verified_email,
+                    contact_form_url,
+                    source_email,
+                    json.dumps(payload),
+                    confidence,
+                    client.model_name if client else GEMINI_MODEL_DEFAULT,
+                ),
+            )
+
+            if verified_email and isinstance(confidence, (int, float)) and confidence >= 0.7:
+                conn.execute(
+                    "UPDATE creator_survey_status SET status_code = 205 WHERE creator_survey_id = ?",
+                    (row["creator_survey_id"],),
+                )
+                updated += 1
+            processed += 1
+        except Exception as exc:
+            if "429" in str(exc):
+                print(f"❌ Gemini rate limit hit (429). Aborting.", file=sys.stderr)
+                conn.commit()
+                conn.close()
+                return 1
+            print(f"⚠️ Gemini recovery failed for adlid={adlid}: {exc}", file=sys.stderr)
+            failures += 1
+        finally:
+            time.sleep(5)
+
+    conn.commit()
+    conn.close()
+    print(
+        "Recovery complete. "
+        f"processed={processed}, updated_status=205:{updated}, skipped_existing={skipped}, failures={failures}"
+    )
+    return 0
+
+
+def classify_creator_topics(args: argparse.Namespace) -> int:
+    db_path = Path(args.adl_db)
+    if not db_path.exists():
+        print(f"❌ DB not found: {db_path}", file=sys.stderr)
+        return 1
+
+    conn = sqlite3.connect(db_path, timeout=10)
+    conn.row_factory = sqlite3.Row
+    configure_sqlite(conn)
+    ensure_creators_table(conn)
+    ensure_podcastindex_tables(conn)
+    ensure_podscan_table(conn)
+    ensure_creator_topics_table(conn)
+    cat_rows = conn.execute(
+        "SELECT apple_id, slug_apple_id, full_path FROM apple_podcast_categories WHERE slug_apple_id IS NOT NULL"
+    ).fetchall()
+    if not cat_rows:
+        print("❌ apple_podcast_categories.slug_apple_id is empty. Run: python3 adl static load --supabase-categories", file=sys.stderr)
+        conn.close()
+        return 1
+    slug_to_id = {r["slug_apple_id"].lower(): r["apple_id"] for r in cat_rows if r["slug_apple_id"]}
+    path_to_id = {}
+    for r in cat_rows:
+        if r["full_path"]:
+            norm = r["full_path"].lower().replace(" > ", " / ").strip()
+            path_to_id[norm] = r["apple_id"]
+    cat_list = [
+        f"{r['slug_apple_id']} | {r['full_path']}"
+        for r in cat_rows
+        if r["slug_apple_id"] and r["full_path"]
+    ]
+
+    rows = conn.execute(
+        """
+        SELECT c.podcastindex_id,
+               c.title AS creator_title,
+               c.description AS creator_description,
+               c.normalized_topics,
+               c.normalized_themes,
+               pf.title AS feed_title,
+               pf.description AS feed_description,
+               pf.category1, pf.category2, pf.category3, pf.category4, pf.category5,
+               ps.full_json,
+               ps.website AS podscan_website,
+               ps.email AS podscan_email
+        FROM creators c
+        JOIN podscan ps ON ps.podcastindex_id = c.podcastindex_id
+        LEFT JOIN podcastindex_feeds pf ON pf.id = c.podcastindex_id
+        WHERE NOT EXISTS (
+            SELECT 1 FROM creator_topics ct WHERE ct.podcastindex_id = c.podcastindex_id
+        )
+          AND (? IS NULL OR c.podcastindex_id = ?)
+        ORDER BY c.podcastindex_id
+        LIMIT ? OFFSET ?
+        """,
+        (getattr(args, "pdi_id", None), getattr(args, "pdi_id", None), args.limit, args.offset),
+    ).fetchall()
+
+    if not rows:
+        print("No creators found for GPT topic classification.")
+        conn.close()
+        return 0
+
+    client = None
+    if not args.dry_run:
+        if not ensure_openai_confirmation("creator topic classification", allow_fallback=False):
+            print("⚠️ OpenAI confirmation declined. Aborting.", file=sys.stderr)
+            conn.close()
+            return 1
+        key = os.getenv("OPENAI_API_KEY")
+        if not key:
+            print("❌ OPENAI_API_KEY not set", file=sys.stderr)
+            conn.close()
+            return 1
+        client = OpenAI(api_key=key)
+
+    inserted = 0
+    skipped = 0
+    no_data = 0
+    empty_output = 0
+    invalid_slug = 0
+    parse_failed = 0
+    format_mismatch = 0
+    ignored = 0
+    inserted_podcasts = set()
+    total_rows = len(rows)
+    commit_every = 5
+    for idx, row in enumerate(rows, start=1):
+        sys.stdout.write(
+            f"\rClassifying {idx}/{total_rows} podcastindex_id={row['podcastindex_id']} "
+            f"success={len(inserted_podcasts)}..."
+        )
+        sys.stdout.flush()
+        pod = {}
+        try:
+            pod = json.loads(row["full_json"]) if row["full_json"] else {}
+        except Exception:
+            pod = {}
+        podcast = pod.get("podcast", {}) if isinstance(pod, dict) else {}
+        pod_name = (podcast.get("podcast_name") or row["creator_title"] or row["feed_title"] or "").strip()
+        pod_desc = (
+            podcast.get("podcast_description")
+            or row["creator_description"]
+            or row["feed_description"]
+            or ""
+        ).strip()
+        pod_site = (podcast.get("podcast_url") or row["podscan_website"] or "").strip()
+        pod_email = (row["podscan_email"] or "").strip()
+        pod_publisher = (podcast.get("publisher_name") or "").strip()
+        topics_hint = (row["normalized_topics"] or "").strip()
+        themes_hint = (row["normalized_themes"] or "").strip()
+        cats_hint = ", ".join([c for c in [row["category1"], row["category2"], row["category3"], row["category4"], row["category5"]] if c])
+
+        if not any([pod_name, pod_desc, pod_site, pod_email, pod_publisher, topics_hint, themes_hint, cats_hint]):
+            skipped += 1
+            no_data += 1
+            sys.stdout.write(" no_data")
+            sys.stdout.flush()
+            continue
+
+        prompt = (
+            "You classify podcasts into Apple Podcast categories.\n"
+            "Choose 1 to 3 categories from the list provided. Return ONLY a JSON object with key 'slugs'.\n"
+            "If there is not enough data to decide, return {\"slugs\": []}.\n\n"
+            "PODCAST DATA:\n"
+            f"Title: {pod_name}\n"
+            f"Description: {pod_desc}\n"
+            f"Publisher: {pod_publisher}\n"
+            f"Website: {pod_site}\n"
+            f"Email: {pod_email}\n"
+            f"Normalized topics: {topics_hint}\n"
+            f"Normalized themes: {themes_hint}\n"
+            f"PodcastIndex categories: {cats_hint}\n\n"
+            "ALLOWED CATEGORIES (slug | path):\n"
+            + "\n".join(cat_list)
+            + "\n\n"
+            "Respond with JSON object only."
+        )
+
+        if args.dry_run:
+            sys.stdout.write("\n")
+            print(prompt)
+            continue
+        try:
+            resp = client.chat.completions.create(
+                model="gpt-4o-mini",
+                messages=[{"role": "user", "content": prompt}],
+                temperature=0.2,
+                response_format={"type": "json_object"},
+            )
+            content = resp.choices[0].message.content
+            data = json.loads(content)
+            slugs = []
+            format_ok = True
+            if isinstance(data, list):
+                slugs = data
+                format_ok = False
+            elif isinstance(data, dict) and "slugs" in data and isinstance(data["slugs"], list):
+                slugs = data["slugs"]
+            elif isinstance(data, dict) and "categories" in data and isinstance(data["categories"], list):
+                slugs = data["categories"]
+                format_ok = False
+            else:
+                format_ok = False
+            if not format_ok:
+                format_mismatch += 1
+                sys.stdout.write(" format_mismatch")
+                sys.stdout.flush()
+
+            resolved_ids = []
+            for s in slugs:
+                if not isinstance(s, str):
+                    continue
+                slug_norm = s.lower().strip()
+                if slug_norm in slug_to_id:
+                    resolved_ids.append(slug_to_id[slug_norm])
+                    continue
+                path_norm = slug_norm.replace(" > ", " / ")
+                if path_norm in path_to_id:
+                    resolved_ids.append(path_to_id[path_norm])
+                    continue
+                invalid_slug += 1
+            if not resolved_ids:
+                empty_output += 1
+                sys.stdout.write(" empty_output")
+                sys.stdout.flush()
+                continue
+            for apple_id in resolved_ids:
+                sql = (
+                    "INSERT OR IGNORE INTO creator_topics (podcastindex_id, apple_category_id) "
+                    f"VALUES ({row['podcastindex_id']}, '{apple_id}');"
+                )
+                if args.debug:
+                    print(f"\nDEBUG INSERT {sql}")
+                cur = conn.execute(
+                    "INSERT OR IGNORE INTO creator_topics (podcastindex_id, apple_category_id) VALUES (?, ?)",
+                    (row["podcastindex_id"], apple_id),
+                )
+                if cur.rowcount == 1:
+                    inserted += 1
+                    sys.stdout.write(f" matched:{apple_id}")
+                    sys.stdout.flush()
+                    inserted_podcasts.add(row["podcastindex_id"])
+                else:
+                    ignored += 1
+        except Exception as exc:
+            parse_failed += 1
+            sys.stdout.write(" parse_failed")
+            sys.stdout.flush()
+            print(f"⚠️ GPT classification failed for {row['podcastindex_id']}: {exc}", file=sys.stderr)
+            continue
+        if idx % commit_every == 0:
+            conn.commit()
+
+    conn.commit()
+    conn.close()
+    sys.stdout.write("\n")
+    print(
+        f"✅ GPT topics inserted={inserted}, ignored={ignored}, podcasts_classified={len(inserted_podcasts)}, skipped={skipped} "
+        f"(no_data={no_data}, empty_output={empty_output}, invalid_slug={invalid_slug}, "
+        f"format_mismatch={format_mismatch}, "
+        f"parse_failed={parse_failed})"
+    )
+    return 0
+
+
+def export_supabase_topic_links(args: argparse.Namespace) -> int:
+    db_path = Path(args.adl_db)
+    if not db_path.exists():
+        print(f"❌ DB not found: {db_path}", file=sys.stderr)
+        return 1
+
+    out_dir = Path(args.out_dir) if getattr(args, "out_dir", None) else Path("tests")
+    out_dir.mkdir(parents=True, exist_ok=True)
+    out_path = out_dir / f"supabase_podcast_category_links_{datetime.utcnow():%Y%m%d%H%M%S}.sql"
+
+    conn = sqlite3.connect(db_path, timeout=10)
+    conn.row_factory = sqlite3.Row
+    configure_sqlite(conn)
+    ensure_creator_topics_table(conn)
+    ensure_apple_categories_table(conn)
+    ensure_creators_table(conn)
+    ensure_podscan_table(conn)
+
+    rows = conn.execute(
+        """
+        SELECT c.adlid AS external_ref,
+               ap.slug_apple_id AS slug
+        FROM creator_topics ct
+        JOIN creators c ON c.podcastindex_id = ct.podcastindex_id
+        JOIN apple_podcast_categories ap ON ap.apple_id = ct.apple_category_id
+        JOIN podscan ps ON ps.podcastindex_id = c.podcastindex_id
+        WHERE ap.slug_apple_id IS NOT NULL
+        ORDER BY c.adlid, ap.slug_apple_id
+        """
+    ).fetchall()
+    conn.close()
+
+    if not rows:
+        print("No topic mappings found to export.")
+        return 0
+
+    with out_path.open("w") as f:
+        f.write("-- Generated podcast category link inserts\n")
+        for row in rows:
+            f.write(
+                "INSERT INTO public.podcast_category_links (podcast_id, category_id, created_at)\n"
+                "SELECT p.id, c.id, now()\n"
+                "FROM public.podcasts p\n"
+                f"JOIN public.podcast_categories c ON c.slug_apple_id = '{row['slug']}'\n"
+                f"WHERE p.external_ref = '{row['external_ref']}'\n"
+                "ON CONFLICT DO NOTHING;\n"
+            )
+
+    print(f"✅ Wrote {out_path}")
+    return 0
+
+
+def verify_socials(args: argparse.Namespace) -> int:
+    db_path = Path(args.adl_db)
+    if not db_path.exists():
+        print(f"❌ DB not found: {db_path}", file=sys.stderr)
+        return 1
+
+    conn = sqlite3.connect(db_path, timeout=10)
+    conn.row_factory = sqlite3.Row
+    configure_sqlite(conn)
+    ensure_podscan_table(conn)
+    ensure_creators_table(conn)
+    ensure_socials_table(conn)
+
+    itunesid = getattr(args, "itunesid", None)
+    limit = args.limit
+    print("🔎 Loading social scan targets...")
+    sys.stdout.flush()
+    rows = conn.execute(
+        """
+        SELECT c.adlid, c.podcastindex_id,
+               COALESCE(NULLIF(ps.itunesid, 0), NULLIF(c.itunesid, 0), NULLIF(pf.itunesId, 0)) AS itunesid,
+               ps.full_json, ps.email AS podscan_email, ps.website AS podscan_website,
+               COALESCE(pf.title, c.title, '') AS podcast_title
+        FROM creators c
+        JOIN podscan ps ON ps.podcastindex_id = c.podcastindex_id
+        LEFT JOIN podcastindex_feeds pf ON pf.id = c.podcastindex_id
+        WHERE COALESCE(NULLIF(ps.itunesid, 0), NULLIF(c.itunesid, 0), NULLIF(pf.itunesId, 0)) IS NOT NULL
+          AND (? IS NULL OR COALESCE(NULLIF(ps.itunesid, 0), NULLIF(c.itunesid, 0), NULLIF(pf.itunesId, 0)) = ?)
+        ORDER BY pf.lastUpdate DESC
+        LIMIT ?
+        """,
+        (itunesid, itunesid, limit),
+    ).fetchall()
+    print(f"🔎 Social scan targets={len(rows)}")
+    spinner = ["|", "/", "-", "\\"]
+    spin_idx = 0
+
+    def status_line(text: str) -> None:
+        nonlocal spin_idx
+        mark = spinner[spin_idx % len(spinner)]
+        spin_idx += 1
+        sys.stdout.write(f"\r{mark} {text}")
+        sys.stdout.flush()
+
+    def detect_platform(url: str) -> str:
+        if "instagram.com" in url or "instagr.am" in url:
+            return "instagram"
+        if "twitter.com" in url or "x.com" in url:
+            return "twitter"
+        if "facebook.com" in url or "fb.com" in url:
+            return "facebook"
+        if "linkedin.com" in url:
+            return "linkedin"
+        if "tiktok.com" in url:
+            return "tiktok"
+        if "youtube.com" in url or "youtu.be" in url:
+            return "youtube"
+        if "threads.net" in url:
+            return "threads"
+        if "substack.com" in url:
+            return "substack"
+        if "bsky.app" in url or "bluesky.social" in url:
+            return "bluesky"
+        return "unknown"
+
+    def extract_handle(url: str) -> str:
+        parsed = urlparse(url)
+        path = (parsed.path or "").strip("/")
+        if not path:
+            return url
+        return path.split("/")[0]
+
+    platforms_all = [
+        "instagram",
+        "twitter",
+        "facebook",
+        "linkedin",
+        "tiktok",
+        "youtube",
+        "threads",
+        "substack",
+        "bluesky",
+    ]
+    inserts = 0
+    updates = 0
+    scanned = 0
+    dry_rows = []
+    dry_prompts = []
+    provider = "gpt" if args.gpt else "gemini"
+    gemini_client = None
+    if not args.dry_run:
+        if provider == "gpt":
+            if not ensure_openai_confirmation("social verification", allow_fallback=False):
+                print("⚠️ OpenAI confirmation declined. Aborting.", file=sys.stderr)
+                conn.close()
+                return 1
+            key = os.getenv("OPENAI_API_KEY")
+            if not key:
+                print("❌ OPENAI_API_KEY not set", file=sys.stderr)
+                conn.close()
+                return 1
+            openai_client = OpenAI(api_key=key)
+        else:
+            gkey = os.getenv("GEMINI_API_KEY")
+            if not gkey:
+                print("❌ GEMINI_API_KEY not set", file=sys.stderr)
+                conn.close()
+                return 1
+            try:
+                gemini_client = GeminiClient(api_key=gkey)
+            except Exception as exc:
+                print(f"❌ Gemini init failed: {exc}", file=sys.stderr)
+                conn.close()
+                return 1
+    for row in rows:
+        scanned += 1
+        pod = json.loads(row["full_json"])
+        podcast = pod.get("podcast", {}) if isinstance(pod, dict) else {}
+        links = (
+            pod.get("podcast", {})
+            .get("reach", {})
+            .get("social_links", [])
+        )
+        if not isinstance(links, list):
+            continue
+        pod_name = (podcast.get("podcast_name") or row["podcast_title"] or "").strip()
+        pod_url = (podcast.get("podcast_url") or podcast.get("reach", {}).get("website") or row["podscan_website"] or "").strip()
+        pod_email = (podcast.get("reach", {}).get("email") or row["podscan_email"] or "").strip()
+        publisher = (podcast.get("publisher_name") or "").strip()
+        present_platforms = set()
+        status_line(
+            f"Scanning itunesid={row['itunesid']} adlid={row['adlid']} links={len(links)}"
+        )
+        if not links:
+            if not (pod_name or pod_url or pod_email or publisher):
+                print(
+                    f"⚠️ Missing discovery context for itunesid={row['itunesid']} adlid={row['adlid']}; skipping",
+                    file=sys.stderr,
+                )
+                continue
+            discovery_prompt = (
+                "Find official social media profiles for this podcast. "
+                "Return only profiles that clearly belong to the show.\n"
+                "Return JSON with socials: an array of {platform, url}.\n\n"
+                f"Podcast title: {pod_name or 'Unknown'}\n"
+                f"Publisher: {publisher}\n"
+                f"Website: {pod_url}\n"
+                f"Email: {pod_email}\n"
+                f"iTunes ID: {row['itunesid']}\n"
+            )
+            if args.dry_run:
+                if provider == "gpt":
+                    dry_prompts.append(("gpt", discovery_prompt))
+                else:
+                    summary_instruction = (
+                        "Use Google Search to find the official social profiles for the podcast. "
+                        "Summarize evidence with sources."
+                    )
+                    dry_prompts.append(("gemini", f"{summary_instruction}\n\n{discovery_prompt}"))
+            else:
+                try:
+                    if provider == "gpt":
+                        resp = openai_client.chat.completions.create(
+                            model="gpt-4o-mini",
+                            messages=[{"role": "user", "content": discovery_prompt}],
+                            temperature=0.2,
+                            response_format={"type": "json_object"},
+                        )
+                        discovery_payload = json.loads(resp.choices[0].message.content)
+                    else:
+                        discovery_schema = {
+                            "type": "object",
+                            "properties": {
+                                "socials": {
+                                    "type": "array",
+                                    "items": {
+                                        "type": "object",
+                                        "properties": {
+                                            "platform": {"type": "string"},
+                                            "url": {"type": "string"},
+                                        },
+                                        "required": ["platform", "url"],
+                                    },
+                                }
+                            },
+                            "required": ["socials"],
+                        }
+                        summary_instruction = (
+                            "Use Google Search to find the official social profiles for the podcast. "
+                            "Summarize evidence with sources."
+                        )
+                        discovery_payload = gemini_client.generate_json_with_schema(
+                            discovery_prompt, discovery_schema, summary_instruction
+                        )
+                    socials = discovery_payload.get("socials", []) if isinstance(discovery_payload, dict) else []
+                    for item in socials:
+                        url = item.get("url") if isinstance(item, dict) else None
+                        if url and isinstance(url, str):
+                            links.append(url)
+                except Exception as exc:
+                    if provider == "gemini" and ("429" in str(exc) or "RESOURCE_EXHAUSTED" in str(exc)):
+                        print("❌ Gemini daily limit reached. Aborting.", file=sys.stderr)
+                        conn.commit()
+                        conn.close()
+                        return 1
+                    print(f"⚠️ Social discovery failed for itunesid={row['itunesid']}: {exc}", file=sys.stderr)
+                    if provider == "gemini":
+                        time.sleep(5)
+        for link in links:
+            if not link or not isinstance(link, str):
+                continue
+            platform = detect_platform(link)
+            handle = extract_handle(link)
+            present_platforms.add(platform)
+            if args.dry_run:
+                dry_rows.append((row["adlid"], row["itunesid"], platform, handle, link))
+                if provider == "gpt":
+                    prompt = (
+                        "You verify podcast social accounts. Given a platform, handle, and URL, "
+                        "estimate if the account appears active and return JSON only.\n"
+                        "Return keys: status_code (100 unknown, 200 verified active, 404 inactive/not found), "
+                        "reach (integer or null), last_post (ISO date or null).\n\n"
+                        f"Platform: {platform}\nHandle: {handle}\nURL: {link}\n"
+                    )
+                    dry_prompts.append(("gpt", prompt))
+                else:
+                    summary_instruction = (
+                        "Use Google Search to verify whether the social profile exists and is active. "
+                        "Summarize evidence with sources."
+                    )
+                    prompt = f"Platform: {platform}\nHandle: {handle}\nURL: {link}\n"
+                    dry_prompts.append(("gemini", f"{summary_instruction}\n\n{prompt}"))
+                continue
+            status_code = 100
+            reach = None
+            last_post = None
+            status_line(
+                f"Verifying {platform} itunesid={row['itunesid']} provider={provider}"
+            )
+            if provider == "gpt":
+                prompt = (
+                    "You verify podcast social accounts. Given a platform, handle, and URL, "
+                    "estimate if the account appears active and return JSON only.\n"
+                    "Return keys: status_code (100 unknown, 200 verified active, 404 inactive/not found), "
+                    "reach (integer or null), last_post (ISO date or null).\n\n"
+                    f"Platform: {platform}\nHandle: {handle}\nURL: {link}\n"
+                )
+                try:
+                    resp = openai_client.chat.completions.create(
+                        model="gpt-4o-mini",
+                        messages=[{"role": "user", "content": prompt}],
+                        temperature=0.2,
+                        response_format={"type": "json_object"},
+                    )
+                    payload = json.loads(resp.choices[0].message.content)
+                except Exception as exc:
+                    print(f"⚠️ GPT verification failed for {link}: {exc}", file=sys.stderr)
+                    continue
+            else:
+                response_schema = {
+                    "type": "object",
+                    "properties": {
+                        "status_code": {"type": "number"},
+                        "reach": {"type": "number"},
+                        "last_post": {"type": "string"},
+                    },
+                    "required": ["status_code", "reach", "last_post"],
+                }
+                summary_instruction = (
+                    "Use Google Search to verify whether the social profile exists and is active. "
+                    "Summarize evidence with sources."
+                )
+                prompt = f"Platform: {platform}\nHandle: {handle}\nURL: {link}\n"
+                try:
+                    payload = gemini_client.generate_json_with_schema(prompt, response_schema, summary_instruction)
+                except Exception as exc:
+                    if "429" in str(exc) or "RESOURCE_EXHAUSTED" in str(exc):
+                        print("❌ Gemini daily limit reached. Aborting.", file=sys.stderr)
+                        conn.commit()
+                        conn.close()
+                        return 1
+                    print(f"⚠️ Gemini verification failed for {link}: {exc}", file=sys.stderr)
+                    continue
+            status_code = int(payload.get("status_code") or 100)
+            reach = payload.get("reach")
+            last_post = payload.get("last_post")
+
+            existing = conn.execute(
+                """
+                SELECT id FROM socials
+                WHERE creator_adlid = ? AND platform = ? AND handle = ?
+                """,
+                (row["adlid"], platform, handle),
+            ).fetchone()
+            if existing and not args.force:
+                continue
+            if existing:
+                conn.execute(
+                    """
+                    UPDATE socials
+                    SET reach = ?, last_post = ?, status = ?, source_url = ?, updated_at = CURRENT_TIMESTAMP
+                    WHERE id = ?
+                    """,
+                    (reach, last_post, status_code, link, existing["id"]),
+                )
+                updates += 1
+            else:
+                conn.execute(
+                    """
+                    INSERT INTO socials (
+                        creator_adlid, platform, handle, reach, last_post, status, source_url
+                    ) VALUES (?, ?, ?, ?, ?, ?, ?)
+                    """,
+                    (row["adlid"], platform, handle, reach, last_post, status_code, link),
+                )
+                inserts += 1
+            if provider == "gemini":
+                time.sleep(5)
+
+        if len(links) <= 1:
+            for platform in platforms_all:
+                if platform in present_platforms:
+                    continue
+                if args.dry_run:
+                    dry_rows.append((row["adlid"], row["itunesid"], platform, "", ""))
+                    continue
+                existing_missing = conn.execute(
+                    """
+                    SELECT id FROM socials
+                    WHERE creator_adlid = ? AND platform = ? AND handle IS NULL
+                    """,
+                    (row["adlid"], platform),
+                ).fetchone()
+                if existing_missing and not args.force:
+                    continue
+                if existing_missing:
+                    conn.execute(
+                        """
+                        UPDATE socials
+                        SET reach = ?, last_post = ?, status = ?, source_url = ?, updated_at = CURRENT_TIMESTAMP
+                        WHERE id = ?
+                        """,
+                        (None, None, 404, None, existing_missing["id"]),
+                    )
+                    updates += 1
+                else:
+                    conn.execute(
+                        """
+                        INSERT INTO socials (
+                            creator_adlid, platform, handle, reach, last_post, status, source_url
+                        ) VALUES (?, ?, ?, ?, ?, ?, ?)
+                        """,
+                        (row["adlid"], platform, None, None, None, 404, None),
+                    )
+                    inserts += 1
+
+    if args.dry_run:
+        sys.stdout.write("\n")
+        if dry_rows:
+            print(format_table(dry_rows, ("adlid", "itunesid", "platform", "handle", "source_url")))
+        else:
+            print("No social links found.")
+        if dry_prompts:
+            print("\nPrompts:")
+            for idx, (prov, prompt) in enumerate(dry_prompts, start=1):
+                print(f"\n[{idx}] provider={prov}\n{prompt}")
+        conn.close()
+        return 0
+
+    conn.commit()
+    conn.close()
+    print(f"✅ Socials scanned={scanned}, inserted={inserts}, updated={updates}")
+    return 0
+
+
+def eml_scanner(args: argparse.Namespace) -> int:
+    eml_dir = Path(args.dir)
+    if not eml_dir.exists() or not eml_dir.is_dir():
+        print(f"❌ Directory not found: {eml_dir}", file=sys.stderr)
+        return 1
+
+    fields = args.field or ["to", "from", "date", "subject"]
+    out_dir = Path(args.out_dir) if args.out_dir else Path("tests")
+    out_dir.mkdir(parents=True, exist_ok=True)
+    out_name = f"eml-scan-{datetime.utcnow():%Y%m%d%H%M%S}.csv"
+    out_path = out_dir / out_name
+
+    def parse_addresses(raw_val: Optional[str]) -> str:
+        addrs = getaddresses([raw_val or ""])
+        emails = [addr.strip().lower() for _, addr in addrs if addr and "@" in addr]
+        return ";".join(emails)
+
+    eml_paths = sorted(eml_dir.glob("*.eml"))
+    if not eml_paths:
+        print("No .eml files found.", file=sys.stderr)
+        return 1
+
+    with out_path.open("w", newline="") as f:
+        writer = csv.writer(f)
+        writer.writerow(fields)
+        for path in eml_paths:
+            try:
+                msg = email.message_from_bytes(path.read_bytes(), policy=policy.default)
+            except Exception as exc:
+                print(f"\033[33m⚠️ Failed to parse {path}: {exc}\033[0m", file=sys.stderr)
+                continue
+            row = []
+            for field in fields:
+                if field == "to":
+                    row.append(parse_addresses(msg.get("To")))
+                elif field == "from":
+                    row.append(parse_addresses(msg.get("From")))
+                elif field == "date":
+                    row.append((msg.get("Date") or "").strip())
+                elif field == "subject":
+                    row.append((msg.get("Subject") or "").strip())
+                else:
+                    row.append("")
+            writer.writerow(row)
+
+    print(f"✅ Wrote {out_path}")
     return 0
 
 
@@ -6937,6 +8061,141 @@ def parse_args(argv: Optional[Sequence[str]] = None) -> argparse.Namespace:
         help="Show creator survey counts by status code",
     )
 
+    recover_parser = subparsers.add_parser("recover-404s", help="Recover undeliverable survey emails with Gemini")
+    recover_parser.add_argument(
+        "--adl-db",
+        type=Path,
+        default=Path("adelined_matching.db"),
+        help="Path to Adelined SQLite database (default: adelined_matching.db)",
+    )
+    recover_parser.add_argument(
+        "--limit",
+        type=int,
+        default=100,
+        help="Max 404 creators to process (default: 100)",
+    )
+    recover_parser.add_argument(
+        "--offset",
+        type=int,
+        default=0,
+        help="Offset into 404 list (default: 0)",
+    )
+    recover_parser.add_argument(
+        "--only-id",
+        type=int,
+        help="Only process a specific creator adlid",
+    )
+    recover_parser.add_argument(
+        "--dry-run",
+        action="store_true",
+        help="Print targets without calling Gemini",
+    )
+
+    socials_parser = subparsers.add_parser("verify-socials", help="Extract social links from Podscan data")
+    socials_parser.add_argument(
+        "--adl-db",
+        type=Path,
+        default=Path("adelined_matching.db"),
+        help="Path to Adelined SQLite database (default: adelined_matching.db)",
+    )
+    socials_parser.add_argument(
+        "--limit",
+        type=int,
+        default=100,
+        help="Max creators to scan (default: 100)",
+    )
+    socials_parser.add_argument(
+        "--itunesid",
+        type=int,
+        help="Only scan a specific iTunes ID",
+    )
+    provider_group = socials_parser.add_mutually_exclusive_group(required=True)
+    provider_group.add_argument(
+        "--gpt",
+        action="store_true",
+        help="Verify socials using OpenAI (may incur cost)",
+    )
+    provider_group.add_argument(
+        "--gemini",
+        action="store_true",
+        help="Verify socials using Gemini search grounding",
+    )
+    socials_parser.add_argument(
+        "--dry-run",
+        action="store_true",
+        help="Print results without inserting",
+    )
+    socials_parser.add_argument(
+        "--force",
+        action="store_true",
+        help="Re-verify and overwrite existing socials rows",
+    )
+
+    classify_parser = subparsers.add_parser(
+        "classify-creator-topics",
+        help="Classify podscan creators into Apple categories using GPT",
+    )
+    classify_parser.add_argument(
+        "--adl-db",
+        type=Path,
+        default=Path("adelined_matching.db"),
+        help="Path to Adelined SQLite database (default: adelined_matching.db)",
+    )
+    classify_parser.add_argument("--limit", type=int, default=200, help="Max creators to process")
+    classify_parser.add_argument("--offset", type=int, default=0, help="Offset into creators table")
+    classify_parser.add_argument(
+        "--dry-run",
+        action="store_true",
+        help="Print prompts without calling GPT or writing",
+    )
+    classify_parser.add_argument(
+        "--debug",
+        action="store_true",
+        help="Print insert statements as they execute",
+    )
+    classify_parser.add_argument(
+        "--pdi-id",
+        type=int,
+        help="Only process a specific podcastindex_id",
+    )
+
+    link_parser = subparsers.add_parser(
+        "export-topic-links",
+        help="Export Supabase SQL to link podcasts to categories",
+    )
+    link_parser.add_argument(
+        "--adl-db",
+        type=Path,
+        default=Path("adelined_matching.db"),
+        help="Path to Adelined SQLite database (default: adelined_matching.db)",
+    )
+    link_parser.add_argument(
+        "--out-dir",
+        help="Output directory for the SQL script",
+    )
+
+    eml_parser = subparsers.add_parser("eml-scanner", help="Scan .eml files into a CSV report")
+    eml_parser.add_argument(
+        "--dir",
+        required=True,
+        help="Directory containing .eml files",
+    )
+    eml_parser.add_argument(
+        "--export",
+        action="store_true",
+        help="Export CSV report (default behavior)",
+    )
+    eml_parser.add_argument(
+        "--out-dir",
+        help="Output directory for the CSV report",
+    )
+    eml_parser.add_argument(
+        "--field",
+        nargs="+",
+        choices=["to", "from", "date", "subject"],
+        help="Fields to include (space-separated)",
+    )
+
     discover_parser = subparsers.add_parser("discover", help="Discover new creators from external sources")
     discover_parser.add_argument(
         "source",
@@ -7023,6 +8282,11 @@ def parse_args(argv: Optional[Sequence[str]] = None) -> argparse.Namespace:
         help="Load Apple podcast categories into apple_podcast_categories table",
     )
     load_parser.add_argument(
+        "--supabase-categories",
+        action="store_true",
+        help="Load Supabase podcast_categories rows and backfill slug_apple_id",
+    )
+    load_parser.add_argument(
         "--adl-db",
         type=Path,
         default=Path("adelined_matching.db"),
@@ -7038,6 +8302,11 @@ def parse_args(argv: Optional[Sequence[str]] = None) -> argparse.Namespace:
     )
     topics_parser.add_argument("--limit", type=int, default=200, help="Max creators to process")
     topics_parser.add_argument("--offset", type=int, default=0, help="Offset into creators table")
+    topics_parser.add_argument(
+        "--podscan-only",
+        action="store_true",
+        help="Only assign topics for creators that exist in the podscan table",
+    )
     topics_parser.add_argument(
         "--ollama-model",
         default=LOCAL_OLLAMA_MODEL,
@@ -7467,6 +8736,11 @@ def parse_args(argv: Optional[Sequence[str]] = None) -> argparse.Namespace:
         help="Public Google Drive folder URL containing .eml files (survey-response-eml)",
     )
     import_parser.add_argument(
+        "--no-recurse",
+        action="store_true",
+        help="Skip subfolders when downloading from Google Drive (survey-response-eml)",
+    )
+    import_parser.add_argument(
         "--sheet-url",
         help="Google Sheet URL (optional for email-survey)",
     )
@@ -7568,6 +8842,15 @@ def parse_args(argv: Optional[Sequence[str]] = None) -> argparse.Namespace:
         help="Overwrite existing podscan rows instead of skipping duplicates",
     )
     update_podscan.add_argument(
+        "--dry-run",
+        action="store_true",
+        help="Fetch and print Podscan JSON without inserting",
+    )
+    update_podscan.add_argument(
+        "--title",
+        help="Optional title filter (substring match)",
+    )
+    update_podscan.add_argument(
         "--month_only",
         help="Restrict last_posted_at to a month like 1_25 (Jan 2025)",
     )
@@ -7657,6 +8940,16 @@ def main(argv: Optional[Sequence[str]] = None) -> int:
             return survey_status_counts(args)
         print("❌ Please provide --count-by-status for survey", file=sys.stderr)
         return 1
+    if args.action == "recover-404s":
+        return recover_404s(args)
+    if args.action == "verify-socials":
+        return verify_socials(args)
+    if args.action == "classify-creator-topics":
+        return classify_creator_topics(args)
+    if args.action == "export-topic-links":
+        return export_supabase_topic_links(args)
+    if args.action == "eml-scanner":
+        return eml_scanner(args)
     if args.action == "enrichment":
         if args.enrichment_action == "clear":
             return clear_enrichment(args)
